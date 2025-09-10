@@ -6,3 +6,5 @@ azr_runs.log
 test_azr_env.py
 test.py
 train.py
+code_review.md
+design_doc.md
