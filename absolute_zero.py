@@ -60,28 +60,6 @@ class AZRRubric(Rubric):
         self.run_logger = _ensure_run_logger()
 
     @staticmethod
-    def _extract_fenced_block(text: str, fence: str) -> Optional[str]:
-        try:
-            flags = re.IGNORECASE | re.DOTALL
-            patterns: List[str]
-            if fence.lower() == "python":
-                patterns = [
-                    r"```python\s*\n?(.*?)\n?```",
-                    r"```py\s*\n?(.*?)\n?```",
-                    # extremely permissive fallback: any code fence
-                    r"```\s*\n?(.*?)\n?```",
-                ]
-            else:
-                patterns = [rf"```{re.escape(fence)}\s*\n?(.*?)\n?```"]
-            for pat in patterns:
-                m = re.search(pat, text, flags)
-                if m:
-                    return m.group(1).strip()
-            return None
-        except Exception:
-            return None
-
-    @staticmethod
     def _parse_literal_maybe_tuple(content: str) -> Tuple[bool, Optional[Any]]:
         s = content.strip()
         # Try JSON first (only if looks like JSON)
@@ -432,6 +410,7 @@ class AZREnv(Environment):
         determinism_runs: int = 2,
         seed: int = 1337420,
         init_zero_triplet: bool = True,
+        verbose: bool = True,
         **kwargs,
     ):
         self.logger = logging.getLogger("AZREnv")
@@ -456,6 +435,7 @@ class AZREnv(Environment):
         self.N = N
         self.j = determinism_runs
         self.seed = seed
+        self.verbose = verbose
 
     # ------------- Prompt builders -------------
 
@@ -612,19 +592,20 @@ class AZREnv(Environment):
             rollout_messages.append({"role": "user", "content": "Continue"})
 
         # Print prompt being sent to model
-        try:
-            print(f"\n[PROMPT TO MODEL] task={task}")
-            print("=" * 60)
-            for i, msg in enumerate(rollout_messages):
-                role = msg.get("role", "unknown")
-                content = msg.get("content", "")
-                print(f"Message {i+1} ({role}):")
-                print(content)
-                print("-" * 40)
-            print("=" * 60)
-            print(f"[END PROMPT]\n")
-        except Exception:
-            pass
+        if self.verbose:
+            try:
+                print(f"\n[PROMPT TO MODEL] task={task}")
+                print("=" * 60)
+                for i, msg in enumerate(rollout_messages):
+                    role = msg.get("role", "unknown")
+                    content = msg.get("content", "")
+                    print(f"Message {i+1} ({role}):")
+                    print(content)
+                    print("-" * 40)
+                print("=" * 60)
+                print(f"[END PROMPT]\n")
+            except Exception:
+                pass
 
         # Call model for main role
         run_logger = _ensure_run_logger()
@@ -726,10 +707,11 @@ class AZREnv(Environment):
                 f"[ROLL] task={task} format_ok={state['format_ok']} json_ok={state['json_ok']} error={(parse_err or '')[:80]}"
             )
             # Print raw model response for debugging
-            print(f"\n[RAW MODEL RESPONSE] task={task}")
-            print(f"Response length: {len(assistant_text)} chars")
-            print(f"Response content:\n{assistant_text}")
-            print(f"[END RAW RESPONSE]\n")
+            if self.verbose:
+                print(f"\n[RAW MODEL RESPONSE] task={task}")
+                print(f"Response length: {len(assistant_text)} chars")
+                print(f"Response content:\n{assistant_text}")
+                print(f"[END RAW RESPONSE]\n")
         except Exception:
             pass
         state["payload"] = {
@@ -941,14 +923,6 @@ class AZREnv(Environment):
     ) -> Tuple[bool, Dict[str, Any], Dict[str, Any]]:
         program = json_obj.get("program", None)
         inp = json_obj.get("input", None)
-        # Normalize stringified JSON arrays/objects to real Python values
-        if isinstance(inp, str):
-            s = inp.strip()
-            if s.startswith("[") or s.startswith("{"):
-                try:
-                    inp = json.loads(s)
-                except Exception:
-                    pass
         payload = {"program": program, "input": inp, "output": None, "message": None, "io_pairs": None, "visible_pairs": None, "hidden_pairs": None}
         if not isinstance(program, str):
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": "Program is not a string"}, payload
@@ -992,14 +966,6 @@ class AZREnv(Environment):
     ) -> Tuple[bool, Dict[str, Any], Dict[str, Any]]:
         program = json_obj.get("program", None)
         inp = json_obj.get("input", None)
-        # Normalize stringified JSON arrays/objects to real Python values
-        if isinstance(inp, str):
-            s = inp.strip()
-            if s.startswith("[") or s.startswith("{"):
-                try:
-                    inp = json.loads(s)
-                except Exception:
-                    pass
         payload = {"program": program, "input": inp, "output": None, "message": None, "io_pairs": None, "visible_pairs": None, "hidden_pairs": None}
         if not isinstance(program, str):
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": "Program is not a string"}, payload
@@ -1043,8 +1009,6 @@ class AZREnv(Environment):
         message = json_obj.get("message", None)
         inputs = json_obj.get("inputs", None)
         payload = {"program": program_context, "input": None, "output": None, "message": message, "io_pairs": None, "visible_pairs": None, "hidden_pairs": None}
-        if not isinstance(program_context, str):
-            return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": "Program context is not a string"}, payload
         if not isinstance(message, str):
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": "Missing or non-string 'message'"}, payload
         if not isinstance(inputs, list) or len(inputs) == 0:
@@ -1126,7 +1090,7 @@ class AZREnv(Environment):
         output = json_obj.get("output", None)
         # Normalize literal types when represented as strings
         if isinstance(output, str):
-            ok, val = self._parse_literal_maybe_tuple(output)
+            ok, val = self.rubric_impl._parse_literal_maybe_tuple(output)
             if ok:
                 output = val
         payload = {
@@ -1145,7 +1109,7 @@ class AZREnv(Environment):
         pred_input = json_obj.get("input", None)
         # Normalize literal types when represented as strings
         if isinstance(pred_input, str):
-            ok, val = self._parse_literal_maybe_tuple(pred_input)
+            ok, val = self.rubric_impl._parse_literal_maybe_tuple(pred_input)
             if ok:
                 pred_input = val
         payload = {
@@ -1216,19 +1180,23 @@ def _make_azr_dataset(
 
 
 def load_environment(
-    max_turns: int = 1,
+    # number of monte carlo samples to use for propose tasks (getting rewards)
     mc_samples: int = 4,
+    # number of references to use for propose tasks
     proposer_K: int = 6,
+    # number of inputs to ask for in induction propose tasks
     N: int = 10,
     determinism_runs: int = 2,
     seed: int = 1337420,
     system_prompt: str = BASE_SYSTEM_PROMPT,
     init_zero_triplet: bool = True,
-    dataset_repeats: int = 1,
+    dataset_repeats: int = 1000,
     # Seeding controls
     seed_buffers: bool = True,
     # Hardcoded preload option for deterministic, client-free seeding
     preload_buffers_hardcoded: bool = False,
+    # Verbose printing control
+    verbose: bool = True,
 ) -> vf.Environment:
     """
     Factory returning an AZREnv instance.
@@ -1250,6 +1218,7 @@ def load_environment(
         determinism_runs=determinism_runs,
         seed=seed,
         init_zero_triplet=init_zero_triplet,
+        verbose=verbose,
     )
     # Optionally pre-seed buffers synchronously (caller can also call env.seed_buffers asynchronously)
     if seed_buffers:

@@ -87,6 +87,7 @@ class AZRExecutor:
         "sum": sum,
         "tuple": tuple,
         "zip": zip,
+        "reversed": reversed,
     }
 
     def _static_scan(self, program: str) -> Optional[str]:
