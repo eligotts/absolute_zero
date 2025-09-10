@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from openai import OpenAI, AsyncOpenAI
 
 from absolute_zero import (
-    AZRParser,
+    AZRXMLParser,
     AZRExecutor,
     AZRBufferManager,
     AZREnv,
@@ -20,10 +20,6 @@ def header(title: str):
     print("\n" + "=" * 80)
     print(title)
     print("=" * 80)
-
-
-def make_r1(payload: dict) -> str:
-    return f"<think>ok</think><answer>\n{json.dumps(payload)}\n</answer>"
 
 
 def configure_logging():
@@ -43,20 +39,41 @@ def configure_logging():
 
 
 async def test_parser():
-    header("Phase 1: AZRParser sanity")
-    parser = AZRParser()
-    ok_text = "<think>t</think><answer>\n{" + '"program":"def f(x):\\n    return x","input":1' + "}\n</answer>"
+    header("Phase 1: AZRXMLParser sanity")
+    parser = AZRXMLParser()
+    ok_text = (
+        "<think>t</think><answer>\n"
+        "```python\n"
+        "def f(x):\n    return x\n"
+        "```\n"
+        "```input\n"
+        "1\n"
+        "```\n"
+        "</answer>"
+    )
+    # Parse just the <answer> text
+    answer_txt = parser.parse_answer(ok_text) or ""
+    print(f"answer_len: {len(answer_txt)} contains_python: {'def f(' in answer_txt}")
+    # Parse fenced blocks within <answer>
+    blocks = parser.parse_answer(ok_text, fences=["python", "input"]) or {}
+    py_blocks = blocks.get("python", []) if isinstance(blocks, dict) else []
+    in_blocks = blocks.get("input", []) if isinstance(blocks, dict) else []
+    print(f"python_blocks: {len(py_blocks)}, input_blocks: {len(in_blocks)}")
+    assert len(py_blocks) == 1 and "def f(" in py_blocks[0]
+    assert len(in_blocks) == 1 and in_blocks[0].strip() == "1"
+
     bad_texts = [
         "no tags",
         "<answer>{}</answer>",
         "<think>only</think>",
-        "<think></think><answer>not json</answer>",
+        "<think></think><answer>no fences here</answer>",
     ]
-    ok, obj, err = parser.try_parse_r1_json(ok_text)
-    print(f"valid_parse_ok: {ok}, obj_keys: {sorted(list(obj.keys())) if obj else None}, err: {err}")
     for i, bt in enumerate(bad_texts):
-        ok, obj, err = parser.try_parse_r1_json(bt)
-        print(f"bad_case_{i}_ok: {ok}, err_contains: {str(err)[:60] if err else None}")
+        ans = parser.parse_answer(bt)
+        blks = parser.parse_answer(bt, fences=["python", "input"]) or {}
+        pyc = len(blks.get("python", [])) if isinstance(blks, dict) else 0
+        inc = len(blks.get("input", [])) if isinstance(blks, dict) else 0
+        print(f"bad_case_{i}: answer_present={ans is not None and len(ans) > 0}, py_blocks={pyc}, in_blocks={inc}")
 
 
 def test_executor():
@@ -197,5 +214,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 

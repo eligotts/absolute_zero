@@ -15,11 +15,23 @@ import math
 import builtins as _py_builtins
 from datasets import Dataset
 from openai import AsyncOpenAI
+from verifiers.parsers.xml_parser import XMLParser
 
 import verifiers as vf
 from verifiers.envs.environment import Environment
 from verifiers.rubrics.rubric import Rubric
 from verifiers.types import ChatMessage, Info, Messages, SamplingArgs, State
+
+from azr_prompts import (
+    INSTRUCTION_FOLLOWING,
+    BASE_SYSTEM_PROMPT,
+    CODE_OUTPUT_PREDICTOR_PROMPT,
+    CODE_INPUT_PREDICTOR_PROMPT,
+    CODE_FUNCTION_PREDICTOR_PROMPT,
+    PROPOSE_DEDUCTION_PROMPT,
+    PROPOSE_ABDUCTION_PROMPT,
+    PROPOSE_INDUCTION_PROMPT,
+)
 
 
 # ------------ Logging setup (file-based) ------------
@@ -38,63 +50,39 @@ def _ensure_run_logger() -> logging.Logger:
     logger.setLevel(logging.INFO)
     return logger
 
+
 # =========================
-# Parser: DeepSeek R1 + JSON
+# Custom parser (XML + fenced extraction)
 # =========================
 
-class AZRParser:
+class AZRXMLParser(XMLParser):
     """
-    Strict parser for DeepSeek R1 style:
-      <think> ... </think>
-      <answer>
-      {JSON}
-      </answer>
+    XML-based parser that extracts the <answer> block and optionally fenced sections within it.
+
+    - parse_answer(completion_or_text) -> str | None: returns inner text of <answer>
+    - parse_answer(completion_or_text, fences=[...]) -> dict[str, list[str]]: returns all fenced blocks per fence
     """
 
-    THINK_OPEN = "<think>"
-    THINK_CLOSE = "</think>"
-    ANSWER_OPEN = "<answer>"
-    ANSWER_CLOSE = "</answer>"
+    def __init__(self):
+        super().__init__(["think", "answer"], answer_field="answer")
 
-    def _extract_block(self, text: str, open_tag: str, close_tag: str) -> Optional[str]:
-        start = text.find(open_tag)
-        end = text.find(close_tag, start + len(open_tag)) if start != -1 else -1
-        if start == -1 or end == -1:
-            return None
-        return text[start + len(open_tag) : end].strip()
-
-    def try_parse_r1_json(self, text: str) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    @staticmethod
+    def _extract_fenced(text: str, fence: str) -> list[str]:
         try:
-            # Enforce tag order: <think> must appear before <answer>
-            think_pos = text.find(self.THINK_OPEN)
-            answer_pos = text.find(self.ANSWER_OPEN)
-            if think_pos == -1 or answer_pos == -1 or think_pos > answer_pos:
-                return False, None, "Missing <think>/<answer> or invalid order"
-            think_block = self._extract_block(text, self.THINK_OPEN, self.THINK_CLOSE)
-            answer_block = self._extract_block(text, self.ANSWER_OPEN, self.ANSWER_CLOSE)
-            if think_block is None or answer_block is None:
-                return False, None, "Missing <think> or <answer> block"
-            # JSON must be the sole content inside <answer>
-            answer_str = answer_block.strip()
-            # Some models wrap with codefences; strip if present
-            if answer_str.startswith("```"):
-                # remove the first fence line and the last fence
-                parts = answer_str.split("```")
-                # parts like ["", "json\n{...}", ""]
-                if len(parts) >= 3:
-                    answer_str = parts[1]
-                    # if language hint present
-                    answer_str = re.sub(r"^\s*[a-zA-Z0-9_+-]+\s*\n", "", answer_str)
-            # Empty answer is a formatting error
-            if not answer_str.strip():
-                return False, None, "Empty <answer> JSON block"
-            obj = json.loads(answer_str)
-            if not isinstance(obj, dict):
-                return False, None, "Answer JSON is not an object"
-            return True, obj, None
-        except Exception as e:
-            # JSON parse failure is a formatting error per design (-1.0)
-            return False, None, f"JSON parse error: {e}"
+            pattern = rf"```{re.escape(fence)}\s*\n?(.*?)\n?```"
+            return [m.strip() for m in re.findall(pattern, text, flags=re.IGNORECASE | re.DOTALL)]
+        except Exception:
+            return []
+
+    def parse_answer(self, completion: Messages | str, fences: Optional[list[str]] = None) -> Any:  # type: ignore[override]
+        answer_str = super().parse_answer(completion)
+        if fences is None:
+            return answer_str
+        blocks: Dict[str, list[str]] = {}
+        answer_text = answer_str or ""
+        for fence in fences:
+            blocks[fence] = self._extract_fenced(answer_text, fence)
+        return blocks
 
 
 # =========================
@@ -433,13 +421,122 @@ class AZRBufferManager:
             return items[:K]
 
 
+# --- Hardcoded preload for target_triplets=3 and target_induction=3 ---
+def preload_buffers(env):
+    """
+    Replace env.buffers with a pre-seeded AZRBufferManager containing:
+      - 3 triplets (including the default identity)
+      - 3 induction items (all based on the most-recent triplet program)
+    This mirrors what a seeding loop would plausibly produce:
+      - add one deduction.propose triplet
+      - add one abduction.propose triplet (most recent -> used for induction contexts)
+      - then add three induction.propose items referencing that most-recent program
+    """
+    bm = AZRBufferManager(seed=getattr(env, "seed", 1337420), init_zero_triplet=False)
+
+    # Triplet 1 (the same "zero" seed the manager uses by default)
+    prog0 = "def f(x):\n    return x"
+    inp0 = "Hello World"
+    out0 = "Hello World"
+    bm.add_triplet(prog0, inp0, out0)  # step_id = 1
+
+    # Triplet 2 (deduction.propose style)
+    prog1 = (
+        "def f(arr):\n"
+        "    b = list(arr)\n"
+        "    for i in range(len(b)):\n"
+        "        if i % 2 == 1:\n"
+        "            b[i] *= 2\n"
+        "    b.reverse()\n"
+        "    s = 0\n"
+        "    sign = 1\n"
+        "    for v in b:\n"
+        "        s += sign * v\n"
+        "        sign *= -1\n"
+        "    return s"
+    )
+    inp1 = [3, 1, 4, 1, 5, 9]
+    out1 = 10  # verified from prog1
+    bm.add_triplet(prog1, inp1, out1)  # step_id = 2
+
+    # Triplet 3 (abduction.propose style)  ← most recent; induction will use this program
+    prog2 = (
+        "def f(s):\n"
+        "    out = []\n"
+        "    if not s:\n"
+        "        return out\n"
+        "    cur = s[0]\n"
+        "    cnt = 1\n"
+        "    for ch in s[1:]:\n"
+        "        if ch == cur:\n"
+        "            cnt += 1\n"
+        "        else:\n"
+        "            out.append((cur, cnt))\n"
+        "            cur = ch\n"
+        "            cnt = 1\n"
+        "    out.append((cur, cnt))\n"
+        "    return sum(cnt * (ord(ch) % 7) for ch, cnt in out)"
+    )
+    inp2 = "MISSISSIPPI"
+    out2 = 42  # verified from prog2
+    bm.add_triplet(prog2, inp2, out2)  # step_id = 3  (=> most recent across union)
+
+    # All induction items below reference prog2 (as sample_program_from_union would)
+    # Each provides 6 inputs; visible/hidden are a 3/3 split (shuffle outcome is plausible).
+
+    # Induction 1
+    msg1 = "Hint: group consecutive identical chars (runs) and sum count*(ord(char)%7)."
+    io1 = [
+        ("AAA", 6),
+        ("ABCD", 14),
+        ("AAAAAA", 12),
+        ("BEEKEEPER", 46),
+        ("ZZZZ", 24),
+        ("ABAB", 10),
+    ]
+    vis1 = io1[:3]
+    hid1 = io1[3:]
+    bm.add_induction(program=prog2, message=msg1, io_pairs=io1, visible=vis1, hidden=hid1)  # step_id = 4
+
+    # Induction 2
+    msg2 = "I score each maximal run by its length times (ord of the character mod 7), then add."
+    io2 = [
+        ("XYZ", 15),
+        ("HELLO", 22),
+        ("A", 2),
+        ("BBBBB", 15),
+        ("CCCDD", 22),
+        ("aAaA", 16),
+    ]
+    vis2 = io2[:3]
+    hid2 = io2[3:]
+    bm.add_induction(program=prog2, message=msg2, io_pairs=io2, visible=vis2, hidden=hid2)  # step_id = 5
+
+    # Induction 3
+    msg3 = "Runs matter, not total length: compress first, then weight by ord(char)%7."
+    io3 = [
+        ("Q", 4),
+        ("QQQ", 12),
+        ("QQQQQQ", 24),
+        ("MNOP", 6),
+        ("ZzZz", 18),
+        ("AAaaBB", 22),
+    ]
+    vis3 = io3[:3]
+    hid3 = io3[3:]
+    bm.add_induction(program=prog2, message=msg3, io_pairs=io3, visible=vis3, hidden=hid3)  # step_id = 6
+
+    # Swap buffers in
+    env.buffers = bm
+    return env
+
 # =========================
 # Rubric: composite AZR reward
 # =========================
 
 class AZRRubric(Rubric):
-    def __init__(self, parser: Optional[AZRParser] = None):
-        self.azr_parser = parser or AZRParser()
+    def __init__(self, parser: Optional[AZRXMLParser] = None):
+        self.azr_parser = parser or AZRXMLParser()
         self.executor = AZRExecutor()
         super().__init__(funcs=[self.azr_reward], weights=[1.0], parser=self.azr_parser)
         self.run_logger = _ensure_run_logger()
@@ -523,58 +620,12 @@ class AZRRubric(Rubric):
         )
 
     def _build_ds_prompt_r(self, program: str, inp: Any) -> List[ChatMessage]:
-        code_output_predictor_prompt = (
-            "\n".join([
-                "# Task: Deduce the Output of a Python Code Snippet Given the Code and Input",
-                "Given the following Code Snippet and the Input, think step by step then deduce the output that will be produced from plugging the Input into the Code Snippet. Put your output in ```output``` tags. Remember if the output is a string, wrap it in quotes. If the function returns multiple values, remember to use a tuple to wrap them.",
-                "",
-                "# Code Snippet:",
-                "```python",
-                "{snippet}",
-                "```",
-                "",
-                "# Input:",
-                "```input",
-                "{input_args}",
-                "```",
-                "",
-                "# Example Output:",
-                "```output",
-                "{{'age': 20, 'city': 'New York'}}",
-                "```",
-            ])
-        )
-        prompt_text = code_output_predictor_prompt.format(snippet=program, input_args=inp)
+        prompt_text = CODE_OUTPUT_PREDICTOR_PROMPT.format(snippet=program, input_args=inp)
         wrapped = INSTRUCTION_FOLLOWING.format(prompt_text)
         return [{"role": "user", "content": wrapped}]
 
     def _build_as_prompt_r(self, program: str, gold_out: Any) -> List[ChatMessage]:
-        code_input_predictor_prompt = (
-            "\n".join([
-                "# Task: Provide One Possible Input of a Python Code Snippet Given the Code and Output",
-                "Given the following Code Snippet and the Output, think step by step then provide one possible input that produced the output. The input needs to be wrapped in ```input``` tags. Remember if an argument is a string, wrap it in quotes. If the function requires multiple arguments, separate them with commas.",
-                "",
-                "# Code Snippet:",
-                "```python",
-                "{snippet}",
-                "```",
-                "",
-                "# Output:",
-                "```output",
-                "{output}",
-                "```",
-                "",
-                "# Output Format:",
-                "```input",
-                "arg1, arg2, ...",
-                "```",
-                "# Example Output:",
-                "```input",
-                "'John', {{'age': 20, 'city': 'New York'}}",
-                "```",
-            ])
-        )
-        prompt_text = code_input_predictor_prompt.format(snippet=program, output=gold_out)
+        prompt_text = CODE_INPUT_PREDICTOR_PROMPT.format(snippet=program, output=gold_out)
         wrapped = INSTRUCTION_FOLLOWING.format(prompt_text)
         return [{"role": "user", "content": wrapped}]
 
@@ -583,46 +634,7 @@ class AZRRubric(Rubric):
         for idx, (inp, out) in enumerate(visible_pairs):
             pairs_str_parts.append(f"```input_{idx}\n{inp}\n```\n```output_{idx}\n{out}\n```\n")
         pairs_block = "".join(pairs_str_parts)
-        code_function_predictor_prompt = (
-            "\n".join([
-                "# Task: Deduce the Function that Produced the Outputs from the Inputs",
-                "Given a set of input/output pairs and a message that describes the function, think through the problem step by step to deduce a general code snippet. This code should produce the hidden outputs from the hidden inputs, matching the original data-generating code that created the input/output pairs. Place your final answer inside python tags! It may be helpful to work through each input/output pair individually to test your function. If your function doesn't work as expected, revise it until it does. The final code snippet will be used to evaluate your response, which is wrapped in ```python``` tags.",
-                "",
-                "# Code Requirements:",
-                "- Name the entry function `f` (e.g., `def f(...): ...`), you can have nested definitions inside `f`",
-                "- Ensure the function returns a value",
-                "- Include at least one input parameter",
-                "- Make the function deterministic",
-                "- AVOID THE FOLLOWING:",
-                "  * Random functions or variables",
-                "  * Date/time operations",
-                "  * I/O operations (reading files, network requests)",
-                "  * Printing or logging",
-                "  * Any external state",
-                "  * Import statements (NO imports allowed - use only built-in functions)",
-                "- Ensure execution completes within 10 seconds on a modern CPU",
-                "- Custom classes are allowed and should be defined at the very top of the code snippet",
-                "- NO import statements of any kind - only use built-in functions like abs, len, max, min, sum, etc.",
-                "- The snippet should end with a return statement from the main function `f()`, anything after will be removed",
-                "",
-                "# Input and Output Pairs:",
-                "{input_output_pairs}",
-                "",
-                "# Message:",
-                "```message",
-                "{message}",
-                "```",
-                "",
-                "# Example Output:",
-                "```python",
-                "def f(a):",
-                "    return a",
-                "```",
-                "",
-                "Name your entry function `f()`!!!",
-            ])
-        )
-        prompt_text = code_function_predictor_prompt.format(input_output_pairs=pairs_block, message=message)
+        prompt_text = CODE_FUNCTION_PREDICTOR_PROMPT.format(input_output_pairs=pairs_block, message=message)
         wrapped = INSTRUCTION_FOLLOWING.format(prompt_text)
         return [{"role": "user", "content": wrapped}]
 
@@ -645,18 +657,13 @@ class AZRRubric(Rubric):
             txt = resp.choices[0].message.content or ""
             parsed_ok = False
             pred_out: Any = None
-            # Preferred: fenced output
-            out_block = self._extract_fenced_block(txt, "output")
-            if out_block is not None:
-                ok, val = self._parse_literal_maybe_tuple(out_block)
+            # Extract fenced output blocks inside <answer>
+            blocks = self.azr_parser.parse_answer(txt, fences=["output"]) or {}
+            outs = blocks.get("output", []) if isinstance(blocks, dict) else []
+            if outs:
+                ok, val = self._parse_literal_maybe_tuple(outs[0])
                 if ok:
                     pred_out, parsed_ok = val, True
-            # Fallback: R1 JSON
-            if not parsed_ok:
-                fmt_ok, jobj, _ = self.azr_parser.try_parse_r1_json(txt)
-                if fmt_ok and jobj is not None:
-                    pred_out = jobj.get("output", None)
-                    parsed_ok = True
             try:
                 self.run_logger.info(json.dumps({
                     "mc_task": "deduction.propose monte carlo rollout solver",
@@ -690,16 +697,12 @@ class AZRRubric(Rubric):
             txt = resp.choices[0].message.content or ""
             parsed_ok = False
             pred_in: Any = None
-            inp_block = self._extract_fenced_block(txt, "input")
-            if inp_block is not None:
-                ok, val = self._parse_literal_maybe_tuple(inp_block)
+            blocks = self.azr_parser.parse_answer(txt, fences=["input"]) or {}
+            ins = blocks.get("input", []) if isinstance(blocks, dict) else []
+            if ins:
+                ok, val = self._parse_literal_maybe_tuple(ins[0])
                 if ok:
                     pred_in, parsed_ok = val, True
-            if not parsed_ok:
-                fmt_ok, jobj, _ = self.azr_parser.try_parse_r1_json(txt)
-                if fmt_ok and jobj is not None:
-                    pred_in = jobj.get("input", None)
-                    parsed_ok = True
             try:
                 self.run_logger.info(json.dumps({
                     "mc_task": "abduction.propose monte carlo rollout solver",
@@ -735,17 +738,11 @@ class AZRRubric(Rubric):
             txt = resp.choices[0].message.content or ""
             parsed_ok = False
             program_src: Optional[str] = None
-            py_block = self._extract_fenced_block(txt, "python")
-            if py_block is not None:
-                program_src = py_block
+            blocks = self.azr_parser.parse_answer(txt, fences=["python"]) or {}
+            pys = blocks.get("python", []) if isinstance(blocks, dict) else []
+            if pys:
+                program_src = pys[0]
                 parsed_ok = True
-            if not parsed_ok:
-                fmt_ok, jobj, _ = self.azr_parser.try_parse_r1_json(txt)
-                if fmt_ok and jobj is not None:
-                    val = jobj.get("program", None)
-                    if isinstance(val, str):
-                        program_src = val
-                        parsed_ok = True
             try:
                 self.run_logger.info(json.dumps({
                     "mc_task": "induction.propose monte carlo rollout solver",
@@ -910,9 +907,9 @@ INSTRUCTION_FOLLOWING = (
 
 # Default system prompt used to seed datasets. Dynamic task prompts are injected during rollout.
 BASE_SYSTEM_PROMPT = (
-    "Follow the required output format strictly: wrap internal reasoning in <think>...</think> and the final answer in "
-    "<answer>...</answer>. The <answer> block must contain ONLY a valid JSON object with double-quoted keys/strings, no "
-    "code fences and no additional text. Do not include any content outside these tags."
+    "Wrap internal reasoning in <think>...</think> and the final answer in <answer>...</answer>. "
+    "Inside <answer>, return content in the required fenced-block format for the task (e.g., ```python```, ```input```, "
+    "```output```, and/or ```message``` blocks). Do not include extra prose outside the required blocks."
 )
 
 FORBIDDEN_DESC = """Forbidden modules/functions: os, sys, shutil, subprocess, pathlib, socket, requests, urllib, http, jsonpickle, pickle, marshal, ctypes, importlib, threading, multiprocessing, random, numpy, pandas, builtins, __import__, eval(), exec(), open(), compile(), globals(), locals(), vars(), setattr(), delattr(), getattr()."""
@@ -933,13 +930,14 @@ class AZREnv(Environment):
         system_prompt: str = BASE_SYSTEM_PROMPT,
         mc_samples: int = 8,
         proposer_K: int = 6,
+        N: int = 10,
         determinism_runs: int = 2,
         seed: int = 1337420,
         init_zero_triplet: bool = True,
         **kwargs,
     ):
         self.logger = logging.getLogger("AZREnv")
-        self.azr_parser = AZRParser()
+        self.azr_parser = AZRXMLParser()
         self.rubric_impl = AZRRubric(parser=self.azr_parser)
         super().__init__(
             dataset=dataset,
@@ -954,6 +952,7 @@ class AZREnv(Environment):
         self.buffers = AZRBufferManager(seed=seed, init_zero_triplet=init_zero_triplet)
         self.mc_samples = mc_samples
         self.K = proposer_K
+        self.N = N
         self.j = determinism_runs
         self.seed = seed
 
@@ -987,311 +986,35 @@ class AZREnv(Environment):
     def _build_dp_prompt(self, K: int) -> ChatMessage:
         # Proposer for deduction -> gen_code_o prompt (verbatim from AZR)
         snippet_blocks = self._render_references(K, problem_type="code_o")
-        remove_after_return_prompt = "- All variable declarations must be inside the main function `f` or within functions `f` make calls to. Any variables declared outside of functions will be removed.\n"
-        remove_input_from_snippet_prompt = ""
-        code_output_prompt = (
-            "\n".join([
-                "## Task: Create a New Python Code Snippet (where custom classes are allowed, which should be defined at the top of the code snippet) with one Matching Input",
-                "",
-                "Using the reference code snippets provided below as examples, design a new and unique Python code snippet that demands deep algorithmic reasoning to deduce the output from the input. Your submission should include a code snippet and a test input pair, where the input will be plugged into the code snippet to produce the output. The input will be given to a test subject to deduce the output, which is meant to be an I.Q. test.",
-                "",
-                "### Code Requirements:",
-                "- Name the entry function `f` (e.g., `def f(...): ...`), you can have nested definitions inside `f`",
-                "- Ensure the function returns a value",
-                "- Include at least one input parameter",
-                "- Make the function deterministic",
-                "- Make the snippet require state tracking across multiple data transformations, ensuring the task requires long multi step reasoning",
-                "- AVOID THE FOLLOWING:",
-                "  * Random functions or variables",
-                "  * Date/time operations",
-                "  * I/O operations (reading files, network requests)",
-                "  * Printing or logging",
-                "  * Any external state",
-                "  * Import statements (NO imports allowed - use only built-in functions)",
-                "- Ensure execution completes within 10 seconds on a modern CPU",
-                "- Custom classes are allowed and should be defined at the very top of the code snippet",
-                "- NO import statements of any kind - only use built-in functions like abs, len, max, min, sum, etc.",
-                "- The snippet should end with a return statement from the main function `f`, anything after will be removed",
-                f"{remove_input_from_snippet_prompt}{remove_after_return_prompt}",
-                "### Input Requirements:",
-                "- Provide exactly one test input for your function",
-                "- For functions with multiple parameters, format as a JSON array: [arg1, arg2, ...]",
-                "- For functions with single parameter, provide the value directly",
-                "- IMPORTANT: If your single parameter expects a list/dict, wrap it in an extra array: [[1,2,3]] or [{\"key\": \"value\"}]",
-                "- Remember to add quotes around string arguments",
-                "- Do NOT quote arrays/objects - input must be real JSON, not a string",
-                "",
-                "### Formatting:",
-                "- Format your code with:",
-                "```python",
-                "def f(...):",
-                "    # your code here",
-                "    return ...",
-                "```",
-                "- Format your input with:",
-                "```input",
-                "arg1, arg2, ...",
-                "```",
-                "",
-                "### Example Format:",
-                "```python",
-                "def f(name: str, info: dict):",
-                "    # code logic here",
-                "    return result",
-                "```",
-                "",
-                "```input",
-                "['John', {'age': 20, 'city': 'New York'}]",
-                "```",
-                "",
-                "### Input Format Examples:",
-                "- Single parameter: \"Hello World\" or 42 or [[1, 2, 3]] (note extra brackets for lists)",
-                "- Multiple parameters: [\"John\", {\"age\": 20}] or [5, 10, \"test\"]",
-                "- Single parameter expecting list: [[1,2,3]] not [1,2,3]",
-                "",
-                "### Evaluation Criteria:",
-                "- Executability, your code should be executable given your input",
-                "- Difficulty in predicting your ```input``` from 1) your ```python``` code and 2) the deterministic ```output``` that will be obtained from your ```input```. Focus on either algorithmic reasoning or logic complexity. For example, you can define complex data structure classes and operate on them like trees, heaps, stacks, queues, graphs, etc, or use complex control flow, dynamic programming, recursions, divide and conquer, greedy, backtracking, etc",
-                "- Creativity, the code needs to be sufficiently different from the provided reference snippets",
-                "- Restricted usage of certain keywords and packages, you are not allowed to use the following words in any form, even in comments: <|BANNED_KEYWORDS|>",
-                "",
-                "### Output Format (CRITICAL):",
-                "Return your final answer using this exact structure:",
-                "",
-                "<think>your reasoning here</think>",
-                "<answer>",
-                '{"program": "def f(x):\\n    return x", "input": "Hello World"}',
-                "</answer>",
-                "",
-                "- The <answer> block MUST contain ONLY a valid JSON object (no prose, no code fences).",
-                "- Use double quotes for all strings; escape newlines as \\n inside string values.",
-                "- Do NOT include the code snippet outside the JSON. Do NOT include the input outside the JSON.",
-                "- Common mistakes to avoid: missing <answer> tags; placing Markdown fences around JSON; adding text after </answer>.",
-                "",
-                "First, carefully devise a clear plan: e.g., identify how your snippet will be challenging, distinct from reference snippets, and creative. Then, write the final code snippet and its inputs.",
-                "",
-                "### Reference Code Snippets:",
-            ])
-            + "\n"
-            + snippet_blocks
-        )
         banned = ", ".join(self._render_banned_keywords())
-        filled = code_output_prompt.replace("<|BANNED_KEYWORDS|>", banned)
+        filled = PROPOSE_DEDUCTION_PROMPT.replace("<|BANNED_KEYWORDS|>", banned) + "\n" + snippet_blocks
         wrapped = INSTRUCTION_FOLLOWING.format(filled)
         return {"role": "user", "content": wrapped}
 
     def _build_ap_prompt(self, K: int) -> ChatMessage:
         # Proposer for abduction -> gen_code_i prompt (verbatim from AZR)
         snippet_blocks = self._render_references(K, problem_type="code_i")
-        remove_after_return_prompt = "- All variable declarations must be inside the main function `f` or within functions `f` make calls to. Any variables declared outside of functions will be removed.\n"
-        remove_input_from_snippet_prompt = ""
-        code_input_prompt = (
-            "\n".join([
-                "## Task: Create a Python Code Snippet (where custom classes are allowed, which should be defined at the top of the code snippet) with one Matching Input",
-                "",
-                "Using the reference code snippets provided below as examples, design a new and unique Python code snippet that demands deep algorithmic reasoning to deduce one possible input from a given output. Your submission should include both a code snippet and test input pair, where the input will be plugged into the code snippet to produce the output, which that function output be given to a test subject to come up with any input that will produce the same function output. This is meant to be an I.Q. test.",
-                "",
-                "### Code Requirements:",
-                "- Name the entry function `f` (e.g., `def f(...): ...`), you can have nested definitions inside `f`",
-                "- Ensure the function returns a value",
-                "- Include at least one input parameter",
-                "- Make the function deterministic",
-                "- Make the snippet require state tracking across multiple data transformations, ensuring the task requires long multi step reasoning",
-                "- AVOID THE FOLLOWING:",
-                "  * Random functions or variables",
-                "  * Date/time operations",
-                "  * I/O operations (reading files, network requests)",
-                "  * Printing or logging",
-                "  * Any external state",
-                "  * Import statements (NO imports allowed - use only built-in functions)",
-                "- Ensure execution completes within 10 seconds on a modern CPU",
-                "- Custom classes are allowed and should be defined at the very top of the code snippet",
-                "- NO import statements of any kind - only use built-in functions like abs, len, max, min, sum, etc.",
-                "- The snippet should end with a return statement from the main function `f`, anything after will be removed",
-                f"{remove_input_from_snippet_prompt}{remove_after_return_prompt}",
-                "### Input Requirements:",
-                "- Provide exactly one test input for your function",
-                "- For functions with multiple parameters, format as a JSON array: [arg1, arg2, ...]",
-                "- For functions with single parameter, provide the value directly",
-                "- IMPORTANT: If your single parameter expects a list/dict, wrap it in an extra array: [[1,2,3]] or [{\"key\": \"value\"}]",
-                "- Remember to add quotes around string arguments",
-                "- Do NOT quote arrays/objects - input must be real JSON, not a string",
-                "",
-                "### Formatting:",
-                "- Format your code with: ```python",
-                "  def f(...):",
-                "      # your code here",
-                "      return ...",
-                "  ```",
-                "- Format your input with: ```input",
-                "  arg1, arg2, ...",
-                "  ```",
-                "",
-                "### Example Format:",
-                "```python",
-                "def f(name: str, info: dict):",
-                "    # code logic here",
-                "    return result",
-                "```",
-                "",
-                "```input",
-                "['John', {'age': 20, 'city': 'New York'}]",
-                "```",
-                "",
-                "### Input Format Examples:",
-                "- Single parameter: \"Hello World\" or 42 or [[1, 2, 3]] (note extra brackets for lists)",
-                "- Multiple parameters: [\"John\", {\"age\": 20}] or [5, 10, \"test\"]",
-                "- Single parameter expecting list: [[1,2,3]] not [1,2,3]",
-                "",
-                "### Evaluation Criteria:",
-                "- Executability, your code should be executable given your input",
-                "- Difficulty in predicting the output from your provided input and code snippet. Focus on either algorithmic reasoning or logic complexity. For example, you can define complex data structure classes and operate on them like trees, heaps, stacks, queues, graphs, etc, or use complex control flow, dynamic programming, recursions, divide and conquer, greedy, backtracking, etc",
-                "- Creativity, the code needs to be sufficiently different from the provided reference snippets",
-                "- Restricted usage of certain keywords and packages, you are not allowed to use the following words in any form, even in comments: <|BANNED_KEYWORDS|>",
-                "",
-                "### Output Format (CRITICAL):",
-                "Return your final answer using this exact structure:",
-                "",
-                "<think>your reasoning here</think>",
-                "<answer>",
-                '{"program": "def f(x):\\n    return x", "input": 123}',
-                "</answer>",
-                "",
-                "- The <answer> block MUST contain ONLY a valid JSON object (no prose, no code fences).",
-                "- Use double quotes for all strings; escape newlines as \\n inside string values.",
-                "- Common mistakes to avoid: missing <answer> tags; placing Markdown fences around JSON; adding any extra text.",
-                "",
-                "First, carefully devise a clear plan: e.g., identify how your snippet will be challenging, distinct from reference snippets, and creative. Then, write the final code snippet and its inputs.",
-                "",
-                "### Reference Code Snippets:",
-            ])
-            + "\n"
-            + snippet_blocks
-        )
         banned = ", ".join(self._render_banned_keywords())
-        filled = code_input_prompt.replace("<|BANNED_KEYWORDS|>", banned)
+        filled = PROPOSE_ABDUCTION_PROMPT.replace("<|BANNED_KEYWORDS|>", banned) + "\n" + snippet_blocks
         wrapped = INSTRUCTION_FOLLOWING.format(filled)
         return {"role": "user", "content": wrapped}
 
-    def _build_ip_prompt(self, program: str, K: int) -> ChatMessage:
+    def _build_ip_prompt(self, program: str, N: int) -> ChatMessage:
         # Proposer for induction -> gen_code_f prompt (verbatim from AZR)
         code_suffix = "\nf(<|YOUR INPUT WILL BE PLUGGED HERE|>)"
-        code_function_prompt = (
-            "\n".join([
-                "## Task: Output {num_inputs} Inputs that can be plugged into the following Code Snippet to produce diverse Outputs, and give a message related to the given snippet.",
-                "",
-                "Using the code snippet provided below, design {num_inputs} inputs that can be plugged into the code snippet to produce a diverse set of outputs. A subset of your given input and its deterministically produced outputs will be given to a test subject to deduce the function, which is meant to be an I.Q. test. You can also leave a message to the test subject to help them deduce the code snippet.",
-                "",
-                "### Input Requirements:",
-                "- Provide {num_inputs} valid inputs for the code snippet",
-                "- For each input, format multiple arguments with commas between them",
-                "- Remember to add quotes around string arguments",
-                "- Each input should be individually wrapped in ```input``` tags",
-                "",
-                "### Message Requirements:",
-                "- Leave a message to the test subject to help them deduce the code snippet",
-                "- The message should be wrapped in ```message``` tags",
-                "- The message can be in any form, can even be formed into a coding question, or a natural language instruction what the code snippet does",
-                "- You cannot provide the code snippet in the message",
-                "",
-                "### Formatting:",
-                "- Format your input with:",
-                "```input",
-                "arg1, arg2, ...",
-                "```",
-                "",
-                "### Example Format:",
-                "```input",
-                "'John', {{'age': 20, 'city': 'New York'}}",
-                "```",
-                "```input",
-                "'Sammy', {{'age': 37, 'city': 'Los Angeles'}}",
-                "```",
-                "",
-                "### Evaluation Criteria:",
-                "- Executability, your code should be executable given your inputs",
-                "- Coverage, the inputs and outputs should cover the whole input space of the code snippet, able to deduce the code snippet from the inputs and outputs",
-                "- Creativity, the inputs need to be sufficiently different from each other",
-                "- The overall selection of inputs and message combined should be challenging for the test subject, but not impossible for them to solve",
-                "First, carefully devise a clear plan: e.g., understand the code snippet, then identify how your proposed inputs have high coverage, and why the inputs will be challenging and creative. Then, write the inputs and message. Remember to wrap your inputs in ```input``` tags, and your message in ```message``` tags.",
-                "",
-                "### Code Snippet:",
-                "```python",
-                "{snippet}",
-                "```",
-                "",
-                "### Output Format (CRITICAL):",
-                "Return your final answer using this exact structure:",
-                "",
-                "<think>your reasoning here</think>",
-                "<answer>",
-                '{{"message": "short helpful hint", "inputs": ["A", "B", "C", "D", "E", "F"]}}',
-                "</answer>",
-                "",
-                "- The <answer> block MUST contain ONLY a valid JSON object with keys: message (string) and inputs (list).",
-                "- Each input must be a valid Python literal matching the snippet’s argument signature.",
-                "- Do NOT wrap JSON in Markdown fences; do NOT add any text outside the tags.",
-            ])
-        )
-        filled_prompt = code_function_prompt.format(num_inputs=self.K, snippet=(program + code_suffix))
+        filled_prompt = PROPOSE_INDUCTION_PROMPT.format(num_inputs=N, snippet=(program + code_suffix))
         wrapped = INSTRUCTION_FOLLOWING.format(filled_prompt)
         return {"role": "user", "content": wrapped}
 
     def _build_ds_prompt(self, item: DeductionItem) -> List[ChatMessage]:
         # Solver for deduction -> pred_code_o prompt (verbatim from AZR)
-        code_output_predictor_prompt = (
-            "\n".join([
-                "# Task: Deduce the Output of a Python Code Snippet Given the Code and Input",
-                "Given the following Code Snippet and the Input, think step by step then deduce the output that will be produced from plugging the Input into the Code Snippet. Put your output in ```output``` tags. Remember if the output is a string, wrap it in quotes. If the function returns multiple values, remember to use a tuple to wrap them.",
-                "",
-                "# Code Snippet:",
-                "```python",
-                "{snippet}",
-                "```",
-                "",
-                "# Input:",
-                "```input",
-                "{input_args}",
-                "```",
-                "",
-                "# Example Output:",
-                "```output",
-                "{{'age': 20, 'city': 'New York'}}",
-                "```",
-            ])
-        )
-        prompt_text = code_output_predictor_prompt.format(snippet=item.program, input_args=item.input)
+        prompt_text = CODE_OUTPUT_PREDICTOR_PROMPT.format(snippet=item.program, input_args=item.input)
         wrapped = INSTRUCTION_FOLLOWING.format(prompt_text)
         return [{"role": "user", "content": wrapped}]
 
     def _build_as_prompt(self, item: AbductionItem) -> List[ChatMessage]:
         # Solver for abduction -> pred_code_i prompt (verbatim from AZR)
-        code_input_predictor_prompt = (
-            "\n".join([
-                "# Task: Provide One Possible Input of a Python Code Snippet Given the Code and Output",
-                "Given the following Code Snippet and the Output, think step by step then provide one possible input that produced the output. The input needs to be wrapped in ```input``` tags. Remember if an argument is a string, wrap it in quotes. If the function requires multiple arguments, separate them with commas.",
-                "",
-                "# Code Snippet:",
-                "```python",
-                "{snippet}",
-                "```",
-                "",
-                "# Output:",
-                "```output",
-                "{output}",
-                "```",
-                "",
-                "# Output Format:",
-                "```input",
-                "arg1, arg2, ...",
-                "```",
-                "# Example Output:",
-                "```input",
-                "'John', {{'age': 20, 'city': 'New York'}}",
-                "```",
-            ])
-        )
-        prompt_text = code_input_predictor_prompt.format(snippet=item.program, output=item.output)
+        prompt_text = CODE_INPUT_PREDICTOR_PROMPT.format(snippet=item.program, output=item.output)
         wrapped = INSTRUCTION_FOLLOWING.format(prompt_text)
         return [{"role": "user", "content": wrapped}]
 
@@ -1301,46 +1024,7 @@ class AZREnv(Environment):
         for idx, (inp, out) in enumerate(item.visible_pairs):
             pairs_str_parts.append(f"```input_{idx}\n{inp}\n```\n```output_{idx}\n{out}\n```\n")
         pairs_block = "".join(pairs_str_parts)
-        code_function_predictor_prompt = (
-            "\n".join([
-                "# Task: Deduce the Function that Produced the Outputs from the Inputs",
-                "Given a set of input/output pairs and a message that describes the function, think through the problem step by step to deduce a general code snippet. This code should produce the hidden outputs from the hidden inputs, matching the original data-generating code that created the input/output pairs. Place your final answer inside python tags! It may be helpful to work through each input/output pair individually to test your function. If your function doesn't work as expected, revise it until it does. The final code snippet will be used to evaluate your response, which is wrapped in ```python``` tags.",
-                "",
-                "# Code Requirements:",
-                "- Name the entry function `f` (e.g., `def f(...): ...`), you can have nested definitions inside `f`",
-                "- Ensure the function returns a value",
-                "- Include at least one input parameter",
-                "- Make the function deterministic",
-                "- AVOID THE FOLLOWING:",
-                "  * Random functions or variables",
-                "  * Date/time operations",
-                "  * I/O operations (reading files, network requests)",
-                "  * Printing or logging",
-                "  * Any external state",
-                "  * Import statements (NO imports allowed - use only built-in functions)",
-                "- Ensure execution completes within 10 seconds on a modern CPU",
-                "- Custom classes are allowed and should be defined at the very top of the code snippet",
-                "- NO import statements of any kind - only use built-in functions like abs, len, max, min, sum, etc.",
-                "- The snippet should end with a return statement from the main function `f()`, anything after will be removed",
-                "",
-                "# Input and Output Pairs:",
-                "{input_output_pairs}",
-                "",
-                "# Message:",
-                "```message",
-                "{message}",
-                "```",
-                "",
-                "# Example Output:",
-                "```python",
-                "def f(a):",
-                "    return a",
-                "```",
-                "",
-                "Name your entry function `f()`!!!",
-            ])
-        )
-        prompt_text = code_function_predictor_prompt.format(input_output_pairs=pairs_block, message=item.message)
+        prompt_text = CODE_FUNCTION_PREDICTOR_PROMPT.format(input_output_pairs=pairs_block, message=item.message)
         wrapped = INSTRUCTION_FOLLOWING.format(prompt_text)
         return [{"role": "user", "content": wrapped}]
 
@@ -1359,6 +1043,7 @@ class AZREnv(Environment):
     ) -> tuple[Messages, State]:
         info = info or {}
         K = int(info.get("K", self.K))
+        N = int(info.get("N", self.N))
         mc = int(info.get("mc_samples", self.mc_samples))
         j = int(info.get("determinism_runs", self.j))
         oai_tools = info.get("oai_tools", None)
@@ -1384,7 +1069,7 @@ class AZREnv(Environment):
                 # Fallback: take latest triplet program
                 refs = self.buffers.get_references(1)
                 induction_context_program = refs[0].program if refs else "def f(x):\n    return x"
-            rollout_messages.append(self._build_ip_prompt(induction_context_program, K))
+            rollout_messages.append(self._build_ip_prompt(induction_context_program, N))
         elif task == "deduction.solve":
             # Prefer recent validated items; fallback to seed
             sampled = self.buffers.sample_deduction()
@@ -1489,37 +1174,51 @@ class AZREnv(Environment):
             },
         }
 
-        format_ok, json_obj, parse_err = self.azr_parser.try_parse_r1_json(assistant_text)
-        state["format_ok"] = bool(format_ok)
+        # Parse answer based on fenced-block formats (no JSON expected)
+        json_obj = None
+        parse_err = None
+
+        try:
+            if task == "deduction.propose" or task == "abduction.propose":
+                blocks = self.azr_parser.parse_answer(assistant_text, fences=["python", "input"]) or {}
+                pys = blocks.get("python", []) if isinstance(blocks, dict) else []
+                ins = blocks.get("input", []) if isinstance(blocks, dict) else []
+                if pys and ins:
+                    ok, in_val = self.rubric_impl._parse_literal_maybe_tuple(ins[0])
+                    in_parsed = in_val if ok else ins[0]
+                    json_obj = {"program": pys[0], "input": in_parsed}
+            elif task == "induction.propose":
+                blocks = self.azr_parser.parse_answer(assistant_text, fences=["message", "input"]) or {}
+                msgs = blocks.get("message", []) if isinstance(blocks, dict) else []
+                ins = blocks.get("input", []) if isinstance(blocks, dict) else []
+                if msgs and ins:
+                    json_obj = {"message": msgs[0], "inputs": ins}
+            elif task == "deduction.solve":
+                blocks = self.azr_parser.parse_answer(assistant_text, fences=["output"]) or {}
+                outs = blocks.get("output", []) if isinstance(blocks, dict) else []
+                if outs:
+                    ok, out_val = self.rubric_impl._parse_literal_maybe_tuple(outs[0])
+                    json_obj = {"output": out_val if ok else outs[0]}
+            elif task == "abduction.solve":
+                blocks = self.azr_parser.parse_answer(assistant_text, fences=["input"]) or {}
+                ins = blocks.get("input", []) if isinstance(blocks, dict) else []
+                if ins:
+                    ok, in_val = self.rubric_impl._parse_literal_maybe_tuple(ins[0])
+                    json_obj = {"input": in_val if ok else ins[0]}
+            elif task == "induction.solve":
+                blocks = self.azr_parser.parse_answer(assistant_text, fences=["python"]) or {}
+                pys = blocks.get("python", []) if isinstance(blocks, dict) else []
+                if pys:
+                    json_obj = {"program": pys[0]}
+            else:
+                # For unsupported tasks, leave json_obj None
+                pass
+        except Exception as e:
+            parse_err = f"fenced-parse error: {e}"
+
+        state["format_ok"] = json_obj is not None
         state["json_ok"] = json_obj is not None
         state["error"] = parse_err
-        # Fallback parsing for SOLVE tasks: accept fenced outputs/python blocks like MC does
-        if (not state["format_ok"]) and isinstance(task, str) and task.endswith(".solve"):
-            fallback_obj: Optional[Dict[str, Any]] = None
-            try:
-                if task == "deduction.solve":
-                    out_block = self._extract_fenced_block(assistant_text, "output")
-                    if out_block is not None:
-                        ok, val = self._parse_literal_maybe_tuple(out_block)
-                        if ok:
-                            fallback_obj = {"output": val}
-                elif task == "abduction.solve":
-                    inp_block = self._extract_fenced_block(assistant_text, "input")
-                    if inp_block is not None:
-                        ok, val = self._parse_literal_maybe_tuple(inp_block)
-                        if ok:
-                            fallback_obj = {"input": val}
-                elif task == "induction.solve":
-                    py_block = self._extract_fenced_block(assistant_text, "python")
-                    if isinstance(py_block, str) and py_block.strip():
-                        fallback_obj = {"program": py_block}
-            except Exception:
-                fallback_obj = None
-            if fallback_obj is not None:
-                json_obj = fallback_obj
-                state["format_ok"] = True
-                state["json_ok"] = True
-                state["error"] = None
         # Diagnostics for rollout formatting
         try:
             self.logger.info(
@@ -1639,6 +1338,7 @@ class AZREnv(Environment):
         # Common info for rollouts
         info_common: Info = {
             "K": self.K,
+            "N": self.N,
             "mc_samples": self.mc_samples,
             "determinism_runs": self.j,
             "oai_tools": oai_tools,
@@ -1923,13 +1623,6 @@ class AZREnv(Environment):
 
     async def _handle_ds(self, json_obj: Dict[str, Any], item: Optional[DeductionItem], determinism_runs: int, raw_text: Optional[str] = None) -> Dict[str, Any]:
         output = json_obj.get("output", None)
-        # If output is missing, try to extract from fenced block
-        if output is None and isinstance(raw_text, str):
-            out_block = self._extract_fenced_block(raw_text, "output")
-            if out_block is not None:
-                ok, val = self._parse_literal_maybe_tuple(out_block)
-                if ok:
-                    output = val
         # Normalize literal types when represented as strings
         if isinstance(output, str):
             ok, val = self._parse_literal_maybe_tuple(output)
@@ -1949,13 +1642,6 @@ class AZREnv(Environment):
 
     async def _handle_as(self, json_obj: Dict[str, Any], item: Optional[AbductionItem], determinism_runs: int, raw_text: Optional[str] = None) -> Dict[str, Any]:
         pred_input = json_obj.get("input", None)
-        # If input is missing, try to extract from fenced block
-        if pred_input is None and isinstance(raw_text, str):
-            inp_block = self._extract_fenced_block(raw_text, "input")
-            if inp_block is not None:
-                ok, val = self._parse_literal_maybe_tuple(inp_block)
-                if ok:
-                    pred_input = val
         # Normalize literal types when represented as strings
         if isinstance(pred_input, str):
             ok, val = self._parse_literal_maybe_tuple(pred_input)
@@ -1975,11 +1661,6 @@ class AZREnv(Environment):
 
     async def _handle_is(self, json_obj: Dict[str, Any], item: Optional[InductionItem], determinism_runs: int, raw_text: Optional[str] = None) -> Dict[str, Any]:
         program = json_obj.get("program", None)
-        # If program is missing, try to extract from fenced python block
-        if (not isinstance(program, str) or not program.strip()) and isinstance(raw_text, str):
-            py_block = self._extract_fenced_block(raw_text, "python")
-            if isinstance(py_block, str) and py_block.strip():
-                program = py_block
         payload = {
             "program": program,
             "input": None,
@@ -2000,6 +1681,7 @@ def _make_azr_dataset(
     system_prompt: str,
     dataset_repeats: int = 1,
     K: int = 6,
+    N: int = 10,
     mc_samples: int = 8,
     determinism_runs: int = 2,
 ) -> Dataset:
@@ -2025,7 +1707,7 @@ def _make_azr_dataset(
                     "answer": "",
                     "task": t,
                     "info": json.dumps(
-                        {"K": K, "mc_samples": mc_samples, "determinism_runs": determinism_runs}
+                        {"K": K, "N": N, "mc_samples": mc_samples, "determinism_runs": determinism_runs}
                     ),
                 }
             )
@@ -2034,8 +1716,9 @@ def _make_azr_dataset(
 
 def load_environment(
     max_turns: int = 1,
-    mc_samples: int = 8,
+    mc_samples: int = 4,
     proposer_K: int = 6,
+    N: int = 10,
     determinism_runs: int = 2,
     seed: int = 1337420,
     system_prompt: str = BASE_SYSTEM_PROMPT,
@@ -2043,8 +1726,8 @@ def load_environment(
     dataset_repeats: int = 1,
     # Seeding controls
     seed_buffers: bool = True,
-    seed_target_triplets: int | None = None,
-    seed_target_induction: int | None = None,
+    # Hardcoded preload option for deterministic, client-free seeding
+    preload_buffers_hardcoded: bool = False,
 ) -> vf.Environment:
     """
     Factory returning an AZREnv instance.
@@ -2053,6 +1736,7 @@ def load_environment(
         system_prompt=system_prompt,
         dataset_repeats=dataset_repeats,
         K=proposer_K,
+        N=N,
         mc_samples=mc_samples,
         determinism_runs=determinism_runs,
     )
@@ -2061,6 +1745,7 @@ def load_environment(
         system_prompt=system_prompt,
         mc_samples=mc_samples,
         proposer_K=proposer_K,
+        N=N,
         determinism_runs=determinism_runs,
         seed=seed,
         init_zero_triplet=init_zero_triplet,
@@ -2074,4 +1759,10 @@ def load_environment(
         pass
 
     # Attach a simple rubric (already inside AZREnv via AZRRubric)
+    if preload_buffers_hardcoded:
+        try:
+            preload_buffers(env)
+            env.logger.info("Buffers preloaded with hardcoded triplets/inductions (3/3).")
+        except Exception as exc:
+            env.logger.exception("Failed to preload buffers: %s", exc)
     return env
