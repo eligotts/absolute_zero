@@ -25,7 +25,7 @@ uv run vf-eval absolute-zero
 Configure model and sampling:
 
 ```bash
-uv run vf-eval absolute-zero   -m gpt-4.1-mini   -n 20 -r 3 -t 1024 -T 0.7   -a '{"key": "value"}'  # env-specific args as JSON
+uv run vf-eval absolute-zero   -m gpt-4.1-mini   -n 6
 ```
 
 Notes:
