@@ -866,7 +866,7 @@ class AZREnv(Environment):
         target_induction: Optional[int] = None,
         sampling_args: Optional[SamplingArgs] = None,
         oai_tools: Optional[Any] = None,
-        max_attempts_per_stage: int = 10,
+        max_attempts_per_stage: int = 20,
         parallel_chunk_size: int = 10,
     ) -> None:
         """
@@ -880,7 +880,7 @@ class AZREnv(Environment):
         This mirrors the Absolute-Zero seeding approach at a high level, adapted to this environment.
         """
         # Determine targets
-        desired_triplets = int(target_triplets) if target_triplets is not None else min(4 * self.K, 4)
+        desired_triplets = int(target_triplets) if target_triplets is not None else max(4 * self.K, 8)
         desired_induction = int(target_induction) if target_induction is not None else desired_triplets
 
         # Common info for rollouts
@@ -1478,7 +1478,7 @@ def _make_azr_dataset(
 
 def load_environment(
     # number of monte carlo samples to use for propose tasks (getting rewards)
-    mc_samples: int = 4,
+    mc_samples: int = 6,
     # number of references to use for propose tasks
     proposer_K: int = 6,
     # number of inputs to ask for in induction propose tasks
