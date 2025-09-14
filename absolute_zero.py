@@ -147,13 +147,12 @@ class AZRRubric(Rubric):
         message_type: str,
     ) -> float:
         messages = self._build_ds_prompt_r(program, inp)
-        correct = 0
-        for idx in range(mc_samples):
+
+        async def run_one(idx: int) -> int:
             resp = await self._mc_model_call(client, model, messages, sampling_args, oai_tools, message_type)
             txt = resp.choices[0].message.content or ""
             parsed_ok = False
             pred_out: Any = None
-            # Extract fenced output blocks inside <answer>
             blocks = self.azr_parser.parse_answer(txt, fences=["output"]) or {}
             outs = blocks.get("output", []) if isinstance(blocks, dict) else []
             if outs:
@@ -171,9 +170,13 @@ class AZRRubric(Rubric):
                 }))
             except Exception:
                 pass
-            if parsed_ok and pred_out == gold_out:
-                correct += 1
-        return correct / float(mc_samples) if mc_samples > 0 else 0.0
+            return 1 if (parsed_ok and pred_out == gold_out) else 0
+
+        if mc_samples <= 0:
+            return 0.0
+        results = await asyncio.gather(*[asyncio.create_task(run_one(i)) for i in range(mc_samples)])
+        correct = sum(int(x) for x in results)
+        return correct / float(mc_samples)
 
     async def _mc_abduction_solve_r(
         self,
@@ -187,8 +190,8 @@ class AZRRubric(Rubric):
         message_type: str,
     ) -> float:
         messages = self._build_as_prompt_r(program, gold_out)
-        correct = 0
-        for idx in range(mc_samples):
+
+        async def run_one(idx: int) -> int:
             resp = await self._mc_model_call(client, model, messages, sampling_args, oai_tools, message_type)
             txt = resp.choices[0].message.content or ""
             parsed_ok = False
@@ -211,9 +214,16 @@ class AZRRubric(Rubric):
                 }))
             except Exception:
                 pass
-            if parsed_ok and self.executor.eval_abduction_input(code=program, gold_output=gold_out, agent_input=pred_in, runs=2):
-                correct += 1
-        return correct / float(mc_samples) if mc_samples > 0 else 0.0
+            ok = parsed_ok and self.executor.eval_abduction_input(
+                code=program, gold_output=gold_out, agent_input=pred_in, runs=2
+            )
+            return 1 if ok else 0
+
+        if mc_samples <= 0:
+            return 0.0
+        results = await asyncio.gather(*[asyncio.create_task(run_one(i)) for i in range(mc_samples)])
+        correct = sum(int(x) for x in results)
+        return correct / float(mc_samples)
 
     async def _mc_induction_solve_r(
         self,
@@ -228,8 +238,8 @@ class AZRRubric(Rubric):
         message_type: str,
     ) -> float:
         messages = self._build_is_prompt_r(visible_pairs, message)
-        correct = 0
-        for idx in range(mc_samples):
+
+        async def run_one(idx: int) -> int:
             resp = await self._mc_model_call(client, model, messages, sampling_args, oai_tools, message_type)
             txt = resp.choices[0].message.content or ""
             parsed_ok = False
@@ -250,9 +260,16 @@ class AZRRubric(Rubric):
                 }))
             except Exception:
                 pass
-            if isinstance(program_src, str) and self.executor.eval_program_on_pairs(code=program_src, io_pairs=hidden_pairs, runs=2):
-                correct += 1
-        return correct / float(mc_samples) if mc_samples > 0 else 0.0
+            ok = isinstance(program_src, str) and self.executor.eval_program_on_pairs(
+                code=program_src, io_pairs=hidden_pairs, runs=2
+            )
+            return 1 if ok else 0
+
+        if mc_samples <= 0:
+            return 0.0
+        results = await asyncio.gather(*[asyncio.create_task(run_one(i)) for i in range(mc_samples)])
+        correct = sum(int(x) for x in results)
+        return correct / float(mc_samples)
 
     async def azr_reward(
         self,
@@ -437,6 +454,18 @@ class AZREnv(Environment):
         self.seed = seed
         self.verbose = verbose
 
+        # --- Auto-seeding coordination primitives ---
+        # Rollouts may start before buffers are seeded. We coordinate a single
+        # real seeding run, while concurrent rollouts wait until seeding completes.
+        # Seeding itself uses rollout(), so we also support an internal bypass flag
+        # to avoid recursion/deadlock.
+        self._seeded: bool = False
+        self._seed_in_progress: bool = False
+        # asyncio primitives are safe to construct here; they are bound to the
+        # running loop when awaited/used.
+        self._seed_lock: asyncio.Lock = asyncio.Lock()
+        self._seed_event: asyncio.Event = asyncio.Event()
+
     # ------------- Prompt builders -------------
 
     def _build_snippet_blocks(self, refs: List[Triplet], problem_type: str) -> str:
@@ -529,6 +558,17 @@ class AZREnv(Environment):
         j = int(info.get("determinism_runs", self.j))
         oai_tools = info.get("oai_tools", None)
 
+        # Auto-seed guard: ensure buffers are populated before proceeding,
+        # unless explicitly bypassed (when called from seed_buffers itself).
+        bypass_auto_seed = bool(info.get("_bypass_seeding", False))
+        if not bypass_auto_seed:
+            await self._ensure_seeded_if_needed(
+                client=client,
+                model=model,
+                sampling_args=sampling_args,
+                oai_tools=oai_tools,
+            )
+
         # Build dynamic messages using AZR-style instruction-following wrappers
         rollout_messages: List[ChatMessage] = []
         if isinstance(prompt, list):
@@ -609,12 +649,18 @@ class AZREnv(Environment):
 
         # Call model for main role
         run_logger = _ensure_run_logger()
+        is_seeding_phase = bool(info.get("_bypass_seeding", False))
         try:
+            if is_seeding_phase:
+                phase = "rollout_request_seeding"
+            else:
+                phase = "rollout_request"
             run_logger.info(json.dumps({
-                "phase": "rollout_request",
+                "phase": phase,
                 "task": task,
                 "messages": rollout_messages,
                 "info": info,
+                "is_seeding": is_seeding_phase,
             }))
         except Exception:
             pass
@@ -629,10 +675,15 @@ class AZREnv(Environment):
         assistant_text = response.choices[0].message.content or ""
         completion: Messages = [{"role": "assistant", "content": assistant_text}]
         try:
+            if is_seeding_phase:
+                phase = "rollout_response_seeding"
+            else:
+                phase = "rollout_response"
             run_logger.info(json.dumps({
-                "phase": "rollout_response",
+                "phase": phase,
                 "task": task,
                 "assistant_text": assistant_text[:4000],
+                "is_seeding": is_seeding_phase,
             }))
         except Exception:
             pass
@@ -701,6 +752,19 @@ class AZREnv(Environment):
         state["format_ok"] = json_obj is not None
         state["json_ok"] = json_obj is not None
         state["error"] = parse_err
+        # Log parsing exceptions to azr_runs.log
+        if parse_err:
+            try:
+                run_logger = _ensure_run_logger()
+                run_logger.error(json.dumps({
+                    "phase": "rollout_parse_error",
+                    "task": task,
+                    "error": parse_err,
+                    "assistant_text_preview": assistant_text[:800],
+                    "is_seeding": is_seeding_phase,
+                }))
+            except Exception:
+                pass
         # Diagnostics for rollout formatting
         try:
             self.logger.info(
@@ -802,7 +866,8 @@ class AZREnv(Environment):
         target_induction: Optional[int] = None,
         sampling_args: Optional[SamplingArgs] = None,
         oai_tools: Optional[Any] = None,
-        max_attempts_per_stage: int = 100,
+        max_attempts_per_stage: int = 10,
+        parallel_chunk_size: int = 10,
     ) -> None:
         """
         Populate buffers by generating valid triplets, then induction items, using propose rollouts.
@@ -815,7 +880,7 @@ class AZREnv(Environment):
         This mirrors the Absolute-Zero seeding approach at a high level, adapted to this environment.
         """
         # Determine targets
-        desired_triplets = int(target_triplets) if target_triplets is not None else max(4 * self.K, 8)
+        desired_triplets = int(target_triplets) if target_triplets is not None else min(4 * self.K, 4)
         desired_induction = int(target_induction) if target_induction is not None else desired_triplets
 
         # Common info for rollouts
@@ -825,6 +890,8 @@ class AZREnv(Environment):
             "mc_samples": self.mc_samples,
             "determinism_runs": self.j,
             "oai_tools": oai_tools,
+            # Internal flag so seed rollouts do not re-enter auto-seeding guard
+            "_bypass_seeding": True,
         }
 
         # Seeding summary header
@@ -835,72 +902,127 @@ class AZREnv(Environment):
         except Exception:
             pass
 
-        # Stage 1: Seed triplets using propose tasks
-        attempts = 0
-        while len(self.buffers.triplet_set) < desired_triplets and attempts < max_attempts_per_stage:
-            attempts += 1
-            # Alternate between deduction and abduction to diversify programs/inputs
-            for task in ("deduction.propose", "abduction.propose"):
-                if len(self.buffers.triplet_set) >= desired_triplets:
-                    break
+        # Stage 1: Seed triplets using propose tasks in parallel chunks
+        need_triplets = max(0, desired_triplets - len(self.buffers.triplet_set))
+        if need_triplets > 0:
+            async def propose_triplet_once(task_type: str) -> bool:
                 try:
-                    before = len(self.buffers.triplet_set)
-                    completion, state = await self.rollout(
+                    _completion, state = await self.rollout(
                         client=client,
                         model=model,
                         prompt=[],
-                        task=task,
+                        task=task_type,
                         info=info_common,
                         sampling_args=sampling_args,
                     )
-                    after = len(self.buffers.triplet_set)
-                    if after > before:
-                        payload = state.get("payload", {}) or {}
-                        prog = payload.get("program")
-                        inp = payload.get("input")
-                        out = payload.get("output")
-                        prog_preview = (prog[:60] + "…") if isinstance(prog, str) and len(prog or "") > 60 else prog
-                        self.logger.info(
-                            f"[SEED OK] {task} added triplet #{after}: input={repr(inp)[:40]} output={repr(out)[:40]} program_preview={repr(prog_preview)}"
-                        )
-                    else:
-                        self.logger.info(
-                            f"[SEED MISS] {task} format_ok={state.get('format_ok')} valid={state.get('valid')} error={(state.get('error') or '')[:80]}"
-                        )
-                except Exception as e:
-                    self.logger.warning(f"[SEED ERR] {task} exception={(str(e) or '')[:120]}")
-                    continue
+                    return bool(state.get("valid", False))
+                except Exception:
+                    return False
 
-        # Stage 2: Seed induction items using propose task conditioned on recent programs
-        attempts = 0
-        while len(self.buffers.induction) < desired_induction and attempts < max_attempts_per_stage:
-            attempts += 1
-            try:
-                before = len(self.buffers.induction)
-                completion, state = await self.rollout(
-                    client=client,
-                    model=model,
-                    prompt=[],
-                    task="induction.propose",
-                    info=info_common,
-                    sampling_args=sampling_args,
-                )
-                after = len(self.buffers.induction)
-                if after > before:
-                    payload = state.get("payload", {}) or {}
-                    msg = payload.get("message")
-                    vis = payload.get("visible_pairs") or []
-                    hid = payload.get("hidden_pairs") or []
-                    self.logger.info(
-                        f"[SEED OK] induction.propose added item #{after}: message_preview={(msg or '')[:50]!r} visible={len(vis)} hidden={len(hid)}"
+            task_cycle = ["deduction.propose", "abduction.propose"]
+            cycle_idx = 0
+            successes_total = 0
+            extra_budget = max_attempts_per_stage
+            remaining = need_triplets
+            while remaining > 0:
+                chunk_target = min(remaining, max(1, int(parallel_chunk_size)))
+                inflight: set[asyncio.Task] = set()
+                for _ in range(chunk_target):
+                    ttype = task_cycle[cycle_idx % len(task_cycle)]
+                    cycle_idx += 1
+                    inflight.add(asyncio.create_task(propose_triplet_once(ttype)))
+
+                successes = 0
+                while inflight and successes < chunk_target:
+                    done, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+                    for d in done:
+                        ok = False
+                        try:
+                            ok = bool(await d)
+                        except Exception:
+                            ok = False
+                        if ok:
+                            successes += 1
+                            successes_total += 1
+                        else:
+                            if extra_budget > 0 and (successes < chunk_target) and (successes_total < need_triplets):
+                                extra_budget -= 1
+                                ttype = task_cycle[cycle_idx % len(task_cycle)]
+                                cycle_idx += 1
+                                inflight.add(asyncio.create_task(propose_triplet_once(ttype)))
+
+                    # Stop early if overall target reached
+                    if successes_total >= need_triplets:
+                        break
+
+                # Cancel any remaining in this chunk when chunk target or overall target satisfied
+                if inflight:
+                    for t in inflight:
+                        t.cancel()
+                    try:
+                        await asyncio.gather(*inflight, return_exceptions=True)
+                    except Exception:
+                        pass
+
+                if successes_total >= need_triplets:
+                    break
+                # Reduce remaining by the number of successes achieved in this chunk
+                remaining = need_triplets - successes_total
+
+        # Safety clamp: do not exceed desired_triplets (best-effort; parallelism might be cancelled mid-flight)
+        # No-op if already within bounds; buffers are append-only so we cannot remove.
+
+        # Stage 2: Seed induction items in parallel chunks
+        need_ind = max(0, desired_induction - len(self.buffers.induction))
+        if need_ind > 0:
+            async def propose_induction_once() -> bool:
+                try:
+                    _completion, state = await self.rollout(
+                        client=client,
+                        model=model,
+                        prompt=[],
+                        task="induction.propose",
+                        info=info_common,
+                        sampling_args=sampling_args,
                     )
-                else:
-                    self.logger.info(
-                        f"[SEED MISS] induction.propose format_ok={state.get('format_ok')} valid={state.get('valid')} error={(state.get('error') or '')[:80]}"
-                    )
-            except Exception as e:
-                self.logger.warning(f"[SEED ERR] induction.propose exception={(str(e) or '')[:120]}")
-                continue
+                    return bool(state.get("valid", False))
+                except Exception:
+                    return False
+
+            successes_total = 0
+            extra_budget = max_attempts_per_stage
+            remaining = need_ind
+            while remaining > 0:
+                chunk_target = min(remaining, max(1, int(parallel_chunk_size)))
+                inflight: set[asyncio.Task] = set(asyncio.create_task(propose_induction_once()) for _ in range(chunk_target))
+                successes = 0
+                while inflight and successes < chunk_target:
+                    done, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+                    for d in done:
+                        ok = False
+                        try:
+                            ok = bool(await d)
+                        except Exception:
+                            ok = False
+                        if ok:
+                            successes += 1
+                            successes_total += 1
+                        else:
+                            if extra_budget > 0 and (successes < chunk_target) and (successes_total < need_ind):
+                                extra_budget -= 1
+                                inflight.add(asyncio.create_task(propose_induction_once()))
+                    if successes_total >= need_ind:
+                        break
+                if inflight:
+                    for t in inflight:
+                        t.cancel()
+                    try:
+                        await asyncio.gather(*inflight, return_exceptions=True)
+                    except Exception:
+                        pass
+                if successes_total >= need_ind:
+                    break
+                remaining = need_ind - successes_total
 
         try:
             self.logger.info(
@@ -908,6 +1030,101 @@ class AZREnv(Environment):
             )
         except Exception:
             pass
+
+    # -------- Auto-seeding helpers --------
+
+    def _desired_seed_targets(self, target_triplets: Optional[int] = None, target_induction: Optional[int] = None) -> tuple[int, int]:
+        desired_triplets = int(target_triplets) if target_triplets is not None else min(4 * self.K, 4)
+        desired_induction = int(target_induction) if target_induction is not None else desired_triplets
+        return desired_triplets, desired_induction
+
+    def _buffers_meet_targets(self, triplets_needed: int, induction_needed: int) -> bool:
+        return len(self.buffers.triplet_set) >= triplets_needed and len(self.buffers.induction) >= induction_needed
+
+    async def _ensure_seeded_if_needed(
+        self,
+        *,
+        client: AsyncOpenAI,
+        model: str,
+        sampling_args: Optional[SamplingArgs],
+        oai_tools: Optional[Any],
+        target_triplets: Optional[int] = None,
+        target_induction: Optional[int] = None,
+    ) -> None:
+        """
+        Ensure buffers are seeded to target sizes. Exactly one rollout caller performs
+        seeding while others wait. Seeding uses rollout() internally with a bypass flag.
+        """
+        triplet_goal, induction_goal = self._desired_seed_targets(target_triplets, target_induction)
+
+        # Fast path if already sufficient
+        if self._buffers_meet_targets(triplet_goal, induction_goal):
+            self._seeded = True
+            # Wake any stale waiters
+            try:
+                self._seed_event.set()
+            except Exception:
+                pass
+            return
+
+        # Multi-attempt loop: wait while another task seeds; otherwise seed.
+        while True:
+            if self._buffers_meet_targets(triplet_goal, induction_goal):
+                self._seeded = True
+                try:
+                    self._seed_event.set()
+                except Exception:
+                    pass
+                return
+
+            if self._seed_in_progress:
+                # Wait until current seeding attempt completes, then re-check.
+                await self._seed_event.wait()
+                # Loop to re-check targets; may start next attempt if still unmet.
+                continue
+
+            # Become the seeding leader
+            async with self._seed_lock:
+                # Double-check after acquiring lock
+                if self._buffers_meet_targets(triplet_goal, induction_goal):
+                    self._seeded = True
+                    try:
+                        self._seed_event.set()
+                    except Exception:
+                        pass
+                    return
+                # Mark in-progress and clear event for waiters
+                self._seed_in_progress = True
+                try:
+                    self._seed_event.clear()
+                except Exception:
+                    pass
+
+            # Perform seeding outside the lock (so rollouts called by seeding can run)
+            try:
+                self.logger.info(
+                    f"[AUTO-SEED] starting: have triplets={len(self.buffers.triplet_set)} induction={len(self.buffers.induction)} target=({triplet_goal},{induction_goal})"
+                )
+            except Exception:
+                pass
+            try:
+                await self.seed_buffers(
+                    client=client,
+                    model=model,
+                    target_triplets=triplet_goal,
+                    target_induction=induction_goal,
+                    sampling_args=sampling_args,
+                    oai_tools=oai_tools,
+                )
+            finally:
+                # Finish attempt, wake waiters; if unmet, a waiter will loop and try again.
+                self._seed_in_progress = False
+                try:
+                    self._seed_event.set()
+                except Exception:
+                    pass
+                # Re-loop to either exit (targets met) or trigger another attempt.
+
 
     # -------- Propose handlers --------
 
@@ -933,11 +1150,34 @@ class AZREnv(Environment):
                 self.logger.info(f"[PROPOSE FAIL] deduction.propose compile error: {err}")
             except Exception:
                 pass
+            # Also log error to azr_runs.log
+            try:
+                run_logger = _ensure_run_logger()
+                run_logger.error(json.dumps({
+                    "phase": "propose_compile_error",
+                    "task": "deduction.propose",
+                    "error": err,
+                    "program_preview": (program[:200] if isinstance(program, str) else None),
+                }))
+            except Exception:
+                pass
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": err}, payload
         ok, out, err2 = self.executor.run_deterministic(f, inp, runs=determinism_runs)
         if not ok:
             try:
                 self.logger.info(f"[PROPOSE FAIL] deduction.propose execution error: {err2}")
+            except Exception:
+                pass
+            # Also log error to azr_runs.log
+            try:
+                run_logger = _ensure_run_logger()
+                run_logger.error(json.dumps({
+                    "phase": "propose_exec_error",
+                    "task": "deduction.propose",
+                    "error": err2,
+                    "program_preview": (program[:200] if isinstance(program, str) else None),
+                    "input_preview": repr(inp)[:120],
+                }))
             except Exception:
                 pass
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": err2}, payload
@@ -975,11 +1215,34 @@ class AZREnv(Environment):
                 self.logger.info(f"[PROPOSE FAIL] abduction.propose compile error: {err}")
             except Exception:
                 pass
+            # Also log error to azr_runs.log
+            try:
+                run_logger = _ensure_run_logger()
+                run_logger.error(json.dumps({
+                    "phase": "propose_compile_error",
+                    "task": "abduction.propose",
+                    "error": err,
+                    "program_preview": (program[:200] if isinstance(program, str) else None),
+                }))
+            except Exception:
+                pass
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": err}, payload
         ok, out, err2 = self.executor.run_deterministic(f, inp, runs=determinism_runs)
         if not ok:
             try:
                 self.logger.info(f"[PROPOSE FAIL] abduction.propose execution error: {err2}")
+            except Exception:
+                pass
+            # Also log error to azr_runs.log
+            try:
+                run_logger = _ensure_run_logger()
+                run_logger.error(json.dumps({
+                    "phase": "propose_exec_error",
+                    "task": "abduction.propose",
+                    "error": err2,
+                    "program_preview": (program[:200] if isinstance(program, str) else None),
+                    "input_preview": repr(inp)[:120],
+                }))
             except Exception:
                 pass
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": err2}, payload
@@ -1016,6 +1279,17 @@ class AZREnv(Environment):
         # Validate inputs against program: compute outputs
         f, err = self.executor.compile_program(program_context)
         if f is None:
+            # Log compile error
+            try:
+                run_logger = _ensure_run_logger()
+                run_logger.error(json.dumps({
+                    "phase": "propose_compile_error",
+                    "task": "induction.propose",
+                    "error": err,
+                    "program_preview": (program_context[:200] if isinstance(program_context, str) else None),
+                }))
+            except Exception:
+                pass
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": f"Compile error: {err}"}, payload
         # Normalize each input: accept Python/JSON literals and multi-arg without parens
         normalized_inputs: List[Any] = []
@@ -1045,6 +1319,17 @@ class AZREnv(Environment):
                     except Exception:
                         pass
                 if not parsed_ok:
+                    # Log input parsing error
+                    try:
+                        run_logger = _ensure_run_logger()
+                        run_logger.error(json.dumps({
+                            "phase": "propose_input_parse_error",
+                            "task": "induction.propose",
+                            "error": f"Invalid input literal",
+                            "literal_preview": s[:120],
+                        }))
+                    except Exception:
+                        pass
                     return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": f"Invalid input literal: {s[:120]}"}, payload
                 normalized_inputs.append(parsed)
             else:
@@ -1060,6 +1345,18 @@ class AZREnv(Environment):
         if not io_pairs:
             first_err = failed[0][1] if failed else "no valid inputs"
             bad_preview = repr(failed[0][0])[:80] if failed else ""
+            # Log execution error for induction inputs
+            try:
+                run_logger = _ensure_run_logger()
+                run_logger.error(json.dumps({
+                    "phase": "propose_exec_error",
+                    "task": "induction.propose",
+                    "error": first_err,
+                    "input_preview": bad_preview,
+                    "program_preview": (program_context[:200] if isinstance(program_context, str) else None),
+                }))
+            except Exception:
+                pass
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": f"All proposed inputs failed. Example: input {bad_preview} -> {first_err}"}, payload
         # Split visible/hidden halves
         random.shuffle(io_pairs)
