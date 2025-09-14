@@ -8,14 +8,17 @@ INSTRUCTION_FOLLOWING = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
     "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
     "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
-    "<think> reasoning process here </think> <answer> answer here </answer>. User: {}\nAssistant: <think>"
+    # "<think> reasoning process here </think> <answer> answer here </answer>. User: {}\nAssistant: <think>"
+    "<think> reasoning process here </think> <answer> answer here </answer>. Here is the task: {}"
+    "REMEMBER TO ANSWER IN THE REQUIRED <think> and <answer> tags, and within the answer, return content in the required fenced-block format for the task (e.g., ```python```, ```input```, ```output```, and/or ```message``` blocks). Do not include extra prose outside the required blocks. IT IS IMPERATIVE THAT YOU WRAP YOUR ANSWER IN THE REQUIRED FENCED-BLOCK FORMAT."
+
 )
 
 # Default system prompt used to seed datasets. Dynamic task prompts are injected during rollout.
 BASE_SYSTEM_PROMPT = (
     "Wrap internal reasoning in <think>...</think> and the final answer in <answer>...</answer>. "
     "Inside <answer>, return content in the required fenced-block format for the task (e.g., ```python```, ```input```, "
-    "```output```, and/or ```message``` blocks). Do not include extra prose outside the required blocks."
+    "```output```, and/or ```message``` blocks). Do not include extra prose outside the required blocks. IT IS IMPERATIVE THAT YOU WRAP YOUR ANSWER IN THE REQUIRED FENCED-BLOCK FORMAT."
 )
 
 # Solver (predictor) prompts
