@@ -1468,9 +1468,7 @@ def _make_azr_dataset(
                     "prompt": deepcopy(base_prompt),
                     "answer": "",
                     "task": t,
-                    "info": json.dumps(
-                        {"K": K, "N": N, "mc_samples": mc_samples, "determinism_runs": determinism_runs}
-                    ),
+                    "info": {"K": K, "N": N, "mc_samples": mc_samples, "determinism_runs": determinism_runs},
                 }
             )
     return Dataset.from_list(rows)
