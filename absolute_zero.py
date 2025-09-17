@@ -53,9 +53,9 @@ def _ensure_run_logger() -> logging.Logger:
 # =========================
 
 class AZRRubric(Rubric):
-    def __init__(self, parser: Optional[AZRXMLParser] = None):
+    def __init__(self, parser: Optional[AZRXMLParser] = None, executor: Optional[AZRExecutor] = None, exec_timeout: float = 5.0):
         self.azr_parser = parser or AZRXMLParser()
-        self.executor = AZRExecutor()
+        self.executor = executor or AZRExecutor(max_exec_seconds=exec_timeout)
         super().__init__(funcs=[self.azr_reward], weights=[1.0], parser=self.azr_parser)
         self.run_logger = _ensure_run_logger()
 
@@ -428,11 +428,13 @@ class AZREnv(Environment):
         seed: int = 1337420,
         init_zero_triplet: bool = True,
         verbose: bool = True,
+        exec_timeout: float = 5.0,
         **kwargs,
     ):
         self.logger = logging.getLogger("AZREnv")
         self.azr_parser = AZRXMLParser()
-        self.rubric_impl = AZRRubric(parser=self.azr_parser)
+        self.executor = AZRExecutor(max_exec_seconds=exec_timeout)
+        self.rubric_impl = AZRRubric(parser=self.azr_parser, executor=self.executor, exec_timeout=exec_timeout)
         super().__init__(
             dataset=dataset,
             system_prompt=None,  # prompts are pre-formatted with system message
@@ -442,7 +444,6 @@ class AZREnv(Environment):
             **kwargs,
         )
         random.seed(seed)
-        self.executor = AZRExecutor()
         self.buffers = AZRBufferManager(seed=seed, init_zero_triplet=init_zero_triplet)
         # number of monte carlo samples to use for propose tasks
         self.mc_samples = mc_samples
@@ -1492,6 +1493,7 @@ def load_environment(
     preload_buffers_hardcoded: bool = False,
     # Verbose printing control
     verbose: bool = True,
+    exec_timeout: float = 5.0,
 ) -> vf.Environment:
     """
     Factory returning an AZREnv instance.
@@ -1514,6 +1516,7 @@ def load_environment(
         seed=seed,
         init_zero_triplet=init_zero_triplet,
         verbose=verbose,
+        exec_timeout=exec_timeout,
     )
     # Optionally pre-seed buffers synchronously (caller can also call env.seed_buffers asynchronously)
     if seed_buffers:

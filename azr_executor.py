@@ -1,7 +1,9 @@
+import builtins as _py_builtins
 import inspect
 import math
+import multiprocessing
 import re
-import builtins as _py_builtins
+import traceback
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -90,13 +92,19 @@ class AZRExecutor:
         "reversed": reversed,
     }
 
-    def _static_scan(self, program: str) -> Optional[str]:
-        for pat in self.DISALLOWED_PATTERNS:
+    def __init__(self, max_exec_seconds: float = 5.0):
+        self.max_exec_seconds = float(max_exec_seconds)
+        self._mp_context = multiprocessing.get_context("spawn")
+
+    @classmethod
+    def _static_scan(cls, program: str) -> Optional[str]:
+        for pat in cls.DISALLOWED_PATTERNS:
             if re.search(pat, program):
                 return f"Program contains disallowed pattern: {pat}"
         return None
 
-    def _discover_callable(self, env: Dict[str, Any]) -> Optional[Callable]:
+    @staticmethod
+    def _discover_callable(env: Dict[str, Any]) -> Optional[Callable]:
         # Prefer 'f', else first callable defined by user (skip dunder)
         if "f" in env and callable(env["f"]):
             return env["f"]
@@ -105,8 +113,8 @@ class AZRExecutor:
                 return v
         return None
 
-    def _call_function(self, f: Callable, inp: Any) -> Any:
-        import inspect
+    @staticmethod
+    def _call_function(f: Callable, inp: Any) -> Any:
         sig = inspect.signature(f)
         try:
             params = list(sig.parameters.values())
@@ -154,22 +162,95 @@ class AZRExecutor:
         f = self._discover_callable(safe_globals)
         if f is None:
             return None, "No callable function found (expected def f(...): ...)"
+        try:
+            setattr(f, "__azr_source__", program)
+        except Exception:
+            pass
         return f, None
 
     def run_deterministic(self, f: Callable, inp: Any, runs: int = 2) -> Tuple[bool, Optional[Any], Optional[str]]:
-        # Execute multiple times on deep-copied inputs to approximate determinism
+        # Execute multiple times in a sandboxed subprocess with timeout to ensure determinism
+        runs = max(2, runs)
+        program_src = getattr(f, "__azr_source__", None)
+        if not isinstance(program_src, str):
+            return False, None, "Missing program source for execution"
+        ok, outputs, error = self._execute_with_timeout(program_src, inp, runs)
+        if not ok:
+            return False, None, error
+        if not outputs:
+            return False, None, "No output produced"
+        first = outputs[0]
+        for out in outputs[1:]:
+            if out != first:
+                return False, None, "Non-deterministic output across runs"
+        return True, first, None
+
+    def _execute_with_timeout(
+        self, program: str, inp: Any, runs: int
+    ) -> Tuple[bool, Optional[List[Any]], Optional[str]]:
+        parent_conn, child_conn = self._mp_context.Pipe(duplex=False)
+        process = self._mp_context.Process(
+            target=_azr_executor_worker,
+            args=(child_conn, program, inp, runs),
+            daemon=True,
+        )
         try:
-            outs = []
-            for _ in range(max(2, runs)):
-                inp_copy = deepcopy(inp)
-                out = self._call_function(f, inp_copy)
-                outs.append(out)
-            for i in range(1, len(outs)):
-                if outs[i] != outs[0]:
-                    return False, None, "Non-deterministic output across runs"
-            return True, outs[0], None
-        except Exception as e:
-            return False, None, f"Execution error: {e}"
+            process.start()
+        except Exception as exc:
+            child_conn.close()
+            parent_conn.close()
+            return False, None, f"Failed to start sandbox process: {exc}"
+        child_conn.close()
+        status = "timeout"
+        payload: Any = "Execution timed out"
+        try:
+            if parent_conn.poll(self.max_exec_seconds):
+                try:
+                    status, payload = parent_conn.recv()
+                except EOFError:
+                    status, payload = "err", "Sandbox exited without returning a result"
+            elif not process.is_alive():
+                status, payload = "err", "Sandbox exited without returning a result"
+        finally:
+            parent_conn.close()
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=1.0)
+        if status == "ok":
+            return True, payload, None
+        if status == "timeout":
+            return False, None, "Execution timed out"
+        return False, None, str(payload)
+
+
+def _azr_executor_worker(conn, program: str, inp: Any, runs: int) -> None:
+    try:
+        err = AZRExecutor._static_scan(program)
+        if err:
+            conn.send(("err", err))
+            return
+        safe_globals: Dict[str, Any] = {
+            "__builtins__": AZRExecutor.ALLOWED_BUILTINS,
+            "__build_class__": _py_builtins.__build_class__,
+            "__name__": "__main__",
+            "math": math,
+        }
+        exec(program, safe_globals, safe_globals)
+        f = AZRExecutor._discover_callable(safe_globals)
+        if f is None:
+            conn.send(("err", "No callable function found (expected def f(...): ...)"))
+            return
+        outputs: List[Any] = []
+        for _ in range(max(2, runs)):
+            outputs.append(AZRExecutor._call_function(f, deepcopy(inp)))
+        conn.send(("ok", outputs))
+    except Exception:
+        conn.send(("err", traceback.format_exc()))
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     # Convenience helpers for common checks
 
