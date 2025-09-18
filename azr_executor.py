@@ -218,6 +218,47 @@ class AZRExecutor:
                 return False, None, "Non-deterministic output across runs"
         return True, first, None
 
+    # Convenience helpers for common checks
+
+    def eval_output_prediction(
+        self,
+        code: str,
+        program_input: Any,
+        gold_output: Any,
+        agent_output: Any,
+        runs: int = 2,
+    ) -> bool:
+        f, err = self.compile_program(code)
+        if f is None:
+            return False
+        ok, out, _ = self.run_deterministic(f, program_input, runs=runs)
+        if not ok:
+            return False
+        return out == agent_output or agent_output == gold_output
+
+    def eval_abduction_input(
+        self, code: str, gold_output: Any, agent_input: Any, runs: int = 2
+    ) -> bool:
+        f, err = self.compile_program(code)
+        if f is None:
+            return False
+        ok, out, _ = self.run_deterministic(f, agent_input, runs=runs)
+        if not ok:
+            return False
+        return out == gold_output
+
+    def eval_program_on_pairs(
+        self, code: str, io_pairs: List[Tuple[Any, Any]], runs: int = 2
+    ) -> bool:
+        f, err = self.compile_program(code)
+        if f is None:
+            return False
+        for inp, out_exp in io_pairs:
+            ok, out, _ = self.run_deterministic(f, inp, runs=runs)
+            if not ok or out != out_exp:
+                return False
+        return True
+
     def _execute_with_timeout(
         self, program: str, inp: Any, runs: int
     ) -> Tuple[bool, Optional[List[Any]], Optional[str]]:
@@ -284,33 +325,3 @@ def _azr_executor_worker(conn, program: str, inp: Any, runs: int) -> None:
             conn.close()
         except Exception:
             pass
-
-    # Convenience helpers for common checks
-
-    def eval_output_prediction(self, code: str, program_input: Any, gold_output: Any, agent_output: Any, runs: int = 2) -> bool:
-        f, err = self.compile_program(code)
-        if f is None:
-            return False
-        ok, out, _ = self.run_deterministic(f, program_input, runs=runs)
-        if not ok:
-            return False
-        return out == agent_output or agent_output == gold_output
-
-    def eval_abduction_input(self, code: str, gold_output: Any, agent_input: Any, runs: int = 2) -> bool:
-        f, err = self.compile_program(code)
-        if f is None:
-            return False
-        ok, out, _ = self.run_deterministic(f, agent_input, runs=runs)
-        if not ok:
-            return False
-        return out == gold_output
-
-    def eval_program_on_pairs(self, code: str, io_pairs: List[Tuple[Any, Any]], runs: int = 2) -> bool:
-        f, err = self.compile_program(code)
-        if f is None:
-            return False
-        for inp, out_exp in io_pairs:
-            ok, out, _ = self.run_deterministic(f, inp, runs=runs)
-            if not ok or out != out_exp:
-                return False
-        return True
