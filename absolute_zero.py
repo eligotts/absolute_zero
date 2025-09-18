@@ -1475,6 +1475,9 @@ def _make_azr_dataset(
     return Dataset.from_list(rows)
 
 
+_AZR_SEED_WARN_ONCE = False
+
+
 def load_environment(
     # number of monte carlo samples to use for propose tasks (getting rewards)
     mc_samples: int = 6,
@@ -1520,11 +1523,11 @@ def load_environment(
     )
     # Optionally pre-seed buffers synchronously (caller can also call env.seed_buffers asynchronously)
     if seed_buffers:
-        # Users must call env.seed_buffers explicitly in async context to actually generate with a client/model
-        env.logger.warning("seed_buffers=True passed, but seeding requires an AsyncOpenAI client and model."
-                          " Call await env.seed_buffers(client, model, target_triplets=..., target_induction=...) after constructing the env.")
-        # We only record intent here; actual seeding is performed by the caller.
-        pass
+        global _AZR_SEED_WARN_ONCE
+        if not _AZR_SEED_WARN_ONCE:
+            _AZR_SEED_WARN_ONCE = True
+            env.logger.warning("seed_buffers=True passed, but seeding requires an AsyncOpenAI client and model."
+                              " Call await env.seed_buffers(client, model, target_triplets=..., target_induction=...) after constructing the env.")
 
     # Attach a simple rubric (already inside AZREnv via AZRRubric)
     if preload_buffers_hardcoded:
