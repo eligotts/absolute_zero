@@ -10,7 +10,7 @@ INSTRUCTION_FOLLOWING = (
     "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
     # "<think> reasoning process here </think> <answer> answer here </answer>. User: {}\nAssistant: <think>"
     "<think> reasoning process here </think> <answer> answer here </answer>. Here is the task: {}"
-    "REMEMBER TO ANSWER IN THE REQUIRED <think> and <answer> tags, and within the answer, return content in the required fenced-block format for the task (e.g., ```python```, ```input```, ```output```, and/or ```message``` blocks). Do not include extra prose outside the required blocks. IT IS IMPERATIVE THAT YOU WRAP YOUR ANSWER IN THE REQUIRED FENCED-BLOCK FORMAT, and that these blocks are wrapped in <answer> tags."
+    "REMEMBER TO ANSWER IN THE REQUIRED <think> and <answer> tags, and within the answer, return content in the required fenced-block format for the task (e.g., ```python```, ```input```, ```output```, and/or ```message``` blocks). Do not include extra prose outside the required blocks. IT IS IMPERATIVE THAT YOU WRAP YOUR ANSWER IN THE REQUIRED FENCED-BLOCK FORMAT, AND THAT THESE FENCED-BLOCKS ARE WRAPPED IN THE <answer></answer> TAGS."
 
 )
 
@@ -222,7 +222,6 @@ PROPOSE_ABDUCTION_PROMPT = "\n".join([
     "",
     "### Formatting:",
     "- Format your code with: ```python",
-    "<answer>",
     "  def f(...):",
     "      # your code here",
     "      return ...",
@@ -230,7 +229,6 @@ PROPOSE_ABDUCTION_PROMPT = "\n".join([
     "- Format your input with: ```input",
     "  arg1, arg2, ...",
     "  ```",
-    "</answer>",
     "",
     "### Example Format:",
     "```python",
@@ -319,6 +317,7 @@ PROPOSE_INDUCTION_PROMPT = "\n".join([
     "### Answer Format (CRITICAL):",
     "Return your final answer using fenced blocks inside <answer>:",
     "",
+    "<answer>",
     "```message",
     "your helpful hint here",
     "```",
@@ -327,6 +326,7 @@ PROPOSE_INDUCTION_PROMPT = "\n".join([
     "arg1, arg2, ...",
     "```",
     "(repeat ```input``` blocks {num_inputs} times)",
+    "</answer>",
 ])
 
 
