@@ -53,7 +53,7 @@ def _ensure_run_logger() -> logging.Logger:
 # =========================
 
 class AZRRubric(Rubric):
-    def __init__(self, parser: Optional[AZRXMLParser] = None, executor: Optional[AZRExecutor] = None, exec_timeout: float = 5.0):
+    def __init__(self, parser: Optional[AZRXMLParser] = None, executor: Optional[AZRExecutor] = None, exec_timeout: float = 20.0):
         self.azr_parser = parser or AZRXMLParser()
         self.executor = executor or AZRExecutor(max_exec_seconds=exec_timeout)
         super().__init__(funcs=[self.azr_reward], weights=[1.0], parser=self.azr_parser)
@@ -428,7 +428,7 @@ class AZREnv(Environment):
         seed: int = 1337420,
         init_zero_triplet: bool = True,
         verbose: bool = True,
-        exec_timeout: float = 5.0,
+        exec_timeout: float = 20.0,
         **kwargs,
     ):
         self.logger = logging.getLogger("AZREnv")
@@ -1493,7 +1493,7 @@ def load_environment(
     preload_buffers_hardcoded: bool = False,
     # Verbose printing control
     verbose: bool = True,
-    exec_timeout: float = 5.0,
+    exec_timeout: float = 20.0,
 ) -> vf.Environment:
     """
     Factory returning an AZREnv instance.
