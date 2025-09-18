@@ -1,6 +1,5 @@
 import builtins as _py_builtins
 import os
-import sys
 import inspect
 import math
 import multiprocessing
@@ -94,30 +93,40 @@ class AZRExecutor:
         "reversed": reversed,
     }
 
-    def __init__(self, max_exec_seconds: float = 5.0, start_method: Optional[str] = None):
+    def __init__(
+        self,
+        max_exec_seconds: float = 5.0,
+        start_method: Optional[str] = None,
+    ):
         self.max_exec_seconds = float(max_exec_seconds)
-        # Choose a start method optimized for ML runtimes:
-        # - Prefer 'forkserver' on Linux to avoid forking a CUDA-initialized process
-        # - Fallback to 'fork' on POSIX for light-weight startup
-        # - Otherwise use 'spawn'
-        method = start_method or os.getenv("AZR_EXECUTOR_START_METHOD")
-        if not method:
-            if sys.platform.startswith("linux"):
-                method = "forkserver"
-            elif sys.platform == "darwin":
-                method = "spawn"
-            else:
-                method = "spawn"
-        # Acquire a context with graceful fallbacks
+
+        requested_method = start_method or os.getenv("AZR_EXECUTOR_START_METHOD")
+        available_methods = multiprocessing.get_all_start_methods()
+
+        candidates: list[str] = []
+        if requested_method:
+            candidates.append(requested_method)
+        else:
+            if "fork" in available_methods:
+                candidates.append("fork")
+            if "forkserver" in available_methods and "forkserver" not in candidates:
+                candidates.append("forkserver")
+            candidates.append("spawn")
+
         ctx: Optional[multiprocessing.context.BaseContext] = None
-        for cand in [method] + [m for m in ("forkserver", "fork", "spawn") if m != method]:
+        self.start_method = None
+        for cand in candidates:
             try:
                 ctx = multiprocessing.get_context(cand)
+                self.start_method = cand
                 break
             except Exception:
                 continue
+
         if ctx is None:
-            ctx = multiprocessing
+            ctx = multiprocessing.get_context()
+            self.start_method = ctx.get_start_method()
+
         self._mp_context = ctx
 
     @classmethod
