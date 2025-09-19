@@ -4,6 +4,7 @@ import inspect
 import math
 import multiprocessing
 import re
+import signal
 import traceback
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -11,6 +12,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # =========================
 # Safe Python executor
 # =========================
+
+class _ExecutionTimeout(Exception):
+    """Raised when user code exceeds the configured runtime budget."""
+
 
 class AZRExecutor:
     """
@@ -107,11 +112,12 @@ class AZRExecutor:
         if requested_method:
             candidates.append(requested_method)
         else:
-            if "fork" in available_methods:
-                candidates.append("fork")
+            if "spawn" in available_methods:
+                candidates.append("spawn")
             if "forkserver" in available_methods and "forkserver" not in candidates:
                 candidates.append("forkserver")
-            candidates.append("spawn")
+            if "fork" in available_methods:
+                candidates.append("fork")
 
         ctx: Optional[multiprocessing.context.BaseContext] = None
         self.start_method = None
@@ -265,7 +271,7 @@ class AZRExecutor:
         parent_conn, child_conn = self._mp_context.Pipe(duplex=False)
         process = self._mp_context.Process(
             target=_azr_executor_worker,
-            args=(child_conn, program, inp, runs),
+            args=(child_conn, program, inp, runs, self.max_exec_seconds),
             daemon=True,
         )
         try:
@@ -289,7 +295,12 @@ class AZRExecutor:
             parent_conn.close()
             if process.is_alive():
                 process.terminate()
-            process.join(timeout=1.0)
+                process.join(timeout=0.5)
+            if process.is_alive():
+                kill = getattr(process, "kill", None)
+                if callable(kill):
+                    kill()
+                process.join(timeout=0.5)
         if status == "ok":
             return True, payload, None
         if status == "timeout":
@@ -297,7 +308,7 @@ class AZRExecutor:
         return False, None, str(payload)
 
 
-def _azr_executor_worker(conn, program: str, inp: Any, runs: int) -> None:
+def _azr_executor_worker(conn, program: str, inp: Any, runs: int, timeout_seconds: float) -> None:
     try:
         err = AZRExecutor._static_scan(program)
         if err:
@@ -314,9 +325,31 @@ def _azr_executor_worker(conn, program: str, inp: Any, runs: int) -> None:
         if f is None:
             conn.send(("err", "No callable function found (expected def f(...): ...)"))
             return
+        max_runs = max(2, runs)
+        timer_supported = hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer")
+        per_run_timeout = None
+        use_timer = False
+        if timeout_seconds and timeout_seconds > 0 and timer_supported:
+            per_run_timeout = max(timeout_seconds / max_runs, 0.01)
+            use_timer = True
+
+            def _raise_timeout(signum, frame):  # type: ignore[unused-argument]
+                raise _ExecutionTimeout(f"Execution exceeded {per_run_timeout:.2f}s budget")
+
+            signal.signal(signal.SIGALRM, _raise_timeout)
+
         outputs: List[Any] = []
-        for _ in range(max(2, runs)):
-            outputs.append(AZRExecutor._call_function(f, deepcopy(inp)))
+        for _ in range(max_runs):
+            if use_timer and per_run_timeout is not None:
+                signal.setitimer(signal.ITIMER_REAL, per_run_timeout)
+            try:
+                outputs.append(AZRExecutor._call_function(f, deepcopy(inp)))
+            except _ExecutionTimeout as exc:
+                conn.send(("timeout", str(exc)))
+                return
+            finally:
+                if use_timer:
+                    signal.setitimer(signal.ITIMER_REAL, 0.0)
         conn.send(("ok", outputs))
     except Exception:
         conn.send(("err", traceback.format_exc()))
