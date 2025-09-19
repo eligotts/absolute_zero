@@ -8,6 +8,11 @@ import traceback
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import concurrent.futures as _futures
+import subprocess as _subprocess
+import sys as _sys
+import json as _json
+import select as _select
+import threading as _threading
 
 # =========================
 # Safe Python executor
@@ -144,6 +149,13 @@ class AZRExecutor:
             self._use_pool = env_flag.strip() not in ("0", "false", "False")
 
         self._pool: Optional[_futures.ProcessPoolExecutor] = None
+        # Choose execution mode: external | pool | process
+        # Default to external when spawn/forkserver is used to avoid importing the trainer.
+        mode_env = os.getenv("AZR_EXECUTOR_MODE", "")
+        if mode_env in ("external", "pool", "process"):
+            self._mode = mode_env
+        else:
+            self._mode = "external" if self.start_method in ("spawn", "forkserver") else "process"
 
     @classmethod
     def _static_scan(cls, program: str) -> Optional[str]:
@@ -278,6 +290,12 @@ class AZRExecutor:
     def _execute_with_timeout(
         self, program: str, inp: Any, runs: int
     ) -> Tuple[bool, Optional[List[Any]], Optional[str]]:
+        # Prefer external worker to avoid re-importing training main under spawn/forkserver
+        mode = getattr(self, "_mode", None)
+        if mode == "external":
+            ok, outputs, err = self._execute_via_external_worker(program, inp, runs)
+            return ok, outputs, err
+
         # Fast path: reuse a persistent worker process to amortize spawn cost
         if self._use_pool:
             try:
@@ -336,12 +354,72 @@ class AZRExecutor:
             return False, None, "Execution timed out"
         return False, None, str(payload)
 
+    # ---------------- External worker (subprocess) ----------------
+
+    def _ensure_external_worker(self) -> None:
+        if getattr(self, "_ext_proc", None) and self._ext_proc.poll() is None:
+            return
+        args = [_sys.executable, "-m", "azr_utils.azr_worker"]
+        self._ext_proc = _subprocess.Popen(
+            args,
+            stdin=_subprocess.PIPE,
+            stdout=_subprocess.PIPE,
+            stderr=_subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        if not hasattr(self, "_ext_lock"):
+            self._ext_lock = _threading.Lock()
+
+    def _execute_via_external_worker(self, program: str, inp: Any, runs: int) -> Tuple[bool, Optional[List[Any]], Optional[str]]:
+        try:
+            self._ensure_external_worker()
+        except Exception as exc:
+            return False, None, f"Failed to start external worker: {exc}"
+        req = {
+            "program": program,
+            "input_literal": repr(inp),
+            "runs": int(max(2, runs)),
+        }
+        line = _json.dumps(req, ensure_ascii=False) + "\n"
+        with self._ext_lock:
+            try:
+                assert self._ext_proc and self._ext_proc.stdin and self._ext_proc.stdout
+                self._ext_proc.stdin.write(line)
+                self._ext_proc.stdin.flush()
+                rlist, _, _ = _select.select([self._ext_proc.stdout], [], [], self.max_exec_seconds)
+                if not rlist:
+                    # kill and restart worker on timeout
+                    self._ext_proc.kill()
+                    self._ext_proc.wait(timeout=1.0)
+                    self._ext_proc = None
+                    return False, None, "Execution timed out"
+                raw = self._ext_proc.stdout.readline()
+                if not raw:
+                    return False, None, "Worker exited unexpectedly"
+                resp = _json.loads(raw)
+            except Exception as exc:
+                return False, None, f"External worker I/O failed: {exc}"
+        status = resp.get("status")
+        if status == "ok":
+            return True, resp.get("payload"), None
+        return False, None, str(resp.get("error", "unknown error"))
+
     def close(self) -> None:
         try:
             if self._pool is not None:
                 self._pool.shutdown(wait=False, cancel_futures=True)
         finally:
             self._pool = None
+        try:
+            if getattr(self, "_ext_proc", None):
+                if self._ext_proc.poll() is None:
+                    self._ext_proc.kill()
+                    self._ext_proc.wait(timeout=1.0)
+        except Exception:
+            pass
+        finally:
+            self._ext_proc = None
 
     def __del__(self) -> None:
         try:
