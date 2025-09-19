@@ -7,6 +7,7 @@ import re
 import traceback
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, Tuple
+import concurrent.futures as _futures
 
 # =========================
 # Safe Python executor
@@ -97,21 +98,24 @@ class AZRExecutor:
         self,
         max_exec_seconds: float = 5.0,
         start_method: Optional[str] = None,
+        use_pool: Optional[bool] = None,
     ):
         self.max_exec_seconds = float(max_exec_seconds)
 
         requested_method = start_method or os.getenv("AZR_EXECUTOR_START_METHOD")
         available_methods = multiprocessing.get_all_start_methods()
 
+        # Prefer safer methods under distributed training: forkserver → spawn → fork (last resort)
         candidates: list[str] = []
         if requested_method:
             candidates.append(requested_method)
         else:
+            if "forkserver" in available_methods:
+                candidates.append("forkserver")
+            if "spawn" in available_methods:
+                candidates.append("spawn")
             if "fork" in available_methods:
                 candidates.append("fork")
-            if "forkserver" in available_methods and "forkserver" not in candidates:
-                candidates.append("forkserver")
-            candidates.append("spawn")
 
         ctx: Optional[multiprocessing.context.BaseContext] = None
         self.start_method = None
@@ -128,6 +132,18 @@ class AZRExecutor:
             self.start_method = ctx.get_start_method()
 
         self._mp_context = ctx
+
+        # Reuse a dedicated worker to avoid repeated heavyweight spawns.
+        # Default: enable pool when using spawn/forkserver, disable for fork.
+        env_flag = os.getenv("AZR_EXECUTOR_USE_POOL")
+        if use_pool is None:
+            self._use_pool = (self.start_method in ("spawn", "forkserver"))
+        else:
+            self._use_pool = bool(use_pool)
+        if env_flag is not None:
+            self._use_pool = env_flag.strip() not in ("0", "false", "False")
+
+        self._pool: Optional[_futures.ProcessPoolExecutor] = None
 
     @classmethod
     def _static_scan(cls, program: str) -> Optional[str]:
@@ -262,6 +278,30 @@ class AZRExecutor:
     def _execute_with_timeout(
         self, program: str, inp: Any, runs: int
     ) -> Tuple[bool, Optional[List[Any]], Optional[str]]:
+        # Fast path: reuse a persistent worker process to amortize spawn cost
+        if self._use_pool:
+            try:
+                if self._pool is None:
+                    self._pool = _futures.ProcessPoolExecutor(
+                        max_workers=1, mp_context=self._mp_context
+                    )
+                fut = self._pool.submit(_azr_pool_task, program, inp, runs)
+                status, payload = fut.result(timeout=self.max_exec_seconds)
+                if status == "ok":
+                    return True, payload, None
+                return False, None, str(payload)
+            except _futures.TimeoutError:
+                # Recreate the pool on timeout to ensure a clean worker
+                try:
+                    if self._pool:
+                        self._pool.shutdown(wait=False, cancel_futures=True)
+                finally:
+                    self._pool = None
+                return False, None, "Execution timed out"
+            except Exception as exc:
+                return False, None, f"Pool execution failed: {exc}"
+
+        # Fallback: one-off process with pipe
         parent_conn, child_conn = self._mp_context.Pipe(duplex=False)
         process = self._mp_context.Process(
             target=_azr_executor_worker,
@@ -296,6 +336,19 @@ class AZRExecutor:
             return False, None, "Execution timed out"
         return False, None, str(payload)
 
+    def close(self) -> None:
+        try:
+            if self._pool is not None:
+                self._pool.shutdown(wait=False, cancel_futures=True)
+        finally:
+            self._pool = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
 
 def _azr_executor_worker(conn, program: str, inp: Any, runs: int) -> None:
     try:
@@ -325,3 +378,26 @@ def _azr_executor_worker(conn, program: str, inp: Any, runs: int) -> None:
             conn.close()
         except Exception:
             pass
+
+
+def _azr_pool_task(program: str, inp: Any, runs: int) -> Tuple[str, Any]:
+    try:
+        err = AZRExecutor._static_scan(program)
+        if err:
+            return ("err", err)
+        safe_globals: Dict[str, Any] = {
+            "__builtins__": AZRExecutor.ALLOWED_BUILTINS,
+            "__build_class__": _py_builtins.__build_class__,
+            "__name__": "__main__",
+            "math": math,
+        }
+        exec(program, safe_globals, safe_globals)
+        f = AZRExecutor._discover_callable(safe_globals)
+        if f is None:
+            return ("err", "No callable function found (expected def f(...): ...)")
+        outputs: List[Any] = []
+        for _ in range(max(2, runs)):
+            outputs.append(AZRExecutor._call_function(f, deepcopy(inp)))
+        return ("ok", outputs)
+    except Exception:
+        return ("err", traceback.format_exc())

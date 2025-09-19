@@ -8,9 +8,9 @@ import time
 import os
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
-from azr_parser import AZRXMLParser
-from azr_executor import AZRExecutor
-from azr_buffers import AZRBufferManager, Triplet, DeductionItem, AbductionItem, InductionItem, preload_buffers
+from azr_utils.azr_parser import AZRXMLParser
+from azr_utils.azr_executor import AZRExecutor
+from azr_utils.azr_buffers import AZRBufferManager, Triplet, DeductionItem, AbductionItem, InductionItem, preload_buffers
 from datasets import Dataset
 from openai import AsyncOpenAI
 
@@ -19,7 +19,7 @@ from verifiers.envs.environment import Environment
 from verifiers.rubrics.rubric import Rubric
 from verifiers.types import ChatMessage, Info, Messages, SamplingArgs, State
 
-from azr_prompts import (
+from azr_utils.azr_prompts import (
     INSTRUCTION_FOLLOWING,
     BASE_SYSTEM_PROMPT,
     CODE_OUTPUT_PREDICTOR_PROMPT,
