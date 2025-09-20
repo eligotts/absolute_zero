@@ -4,12 +4,14 @@ import inspect
 import math
 import multiprocessing as mp
 import os
+import pickle
+import queue
 import re
 import signal
 import threading
+import time
 import traceback
 from copy import deepcopy
-from multiprocessing.pool import MaybeEncodingError
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # =========================
@@ -146,7 +148,13 @@ class AZRExecutor:
             self.start_method = ctx.get_start_method()
 
         self._mp_context = ctx
-        self._pool: Optional[mp.pool.Pool] = None
+        self._task_queue = None
+        self._result_queue = None
+        self._workers: List[mp.Process] = []
+        self._job_counter = 0
+        self._job_lock = threading.Lock()
+        self._result_cache: Dict[int, Tuple[str, Any]] = {}
+        self._cache_lock = threading.Lock()
         self._pool_lock = threading.Lock()
         atexit.register(self.shutdown)
 
@@ -283,16 +291,16 @@ class AZRExecutor:
     def _execute_with_timeout(
         self, program: str, inp: Any, runs: int
     ) -> Tuple[bool, Optional[List[Any]], Optional[str]]:
-        job = self._submit_job(program, inp, runs)
+        job_id = self._submit_job(program, inp, runs)
         wait_timeout = max(self.max_exec_seconds, 0.1) + 0.5
         try:
-            status, payload = job.get(timeout=wait_timeout)
+            status, payload = self._get_result(job_id, wait_timeout)
         except mp.TimeoutError:
             self._restart_pool()
             return False, None, "Execution timed out"
-        except MaybeEncodingError as exc:
+        except RuntimeError as exc:
             self._restart_pool()
-            return False, None, f"Serialization error: {exc}"
+            return False, None, str(exc)
         except Exception as exc:
             self._restart_pool()
             return False, None, str(exc)
@@ -303,45 +311,137 @@ class AZRExecutor:
             return False, None, "Execution timed out"
         return False, None, str(payload)
 
-    def _submit_job(self, program: str, inp: Any, runs: int):
-        pool = self._ensure_pool()
-        assert pool is not None
-        return pool.apply_async(
-            _run_program_with_timeout,
-            args=(program, inp, runs, self.max_exec_seconds),
-        )
+    def _submit_job(self, program: str, inp: Any, runs: int) -> int:
+        self._ensure_pool()
+        assert self._task_queue is not None
+        with self._job_lock:
+            job_id = self._job_counter
+            self._job_counter += 1
+        try:
+            self._task_queue.put((job_id, program, inp, runs, self.max_exec_seconds))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to enqueue job: {exc}") from exc
+        return job_id
 
-    def _ensure_pool(self) -> Optional[mp.pool.Pool]:
+    def _get_result(self, job_id: int, timeout: float) -> Tuple[str, Any]:
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._cache_lock:
+                cached = self._result_cache.pop(job_id, None)
+            if cached is not None:
+                return cached
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise mp.TimeoutError()
+
+            if self._result_queue is None:
+                raise RuntimeError("Worker result queue unavailable")
+            try:
+                job_result = self._result_queue.get(timeout=remaining)
+            except queue.Empty:
+                raise mp.TimeoutError()
+            except (EOFError, OSError) as exc:
+                raise RuntimeError(f"Worker pool communication error: {exc}") from exc
+
+            if not isinstance(job_result, tuple) or len(job_result) != 3:
+                continue
+            result_job_id, status, payload = job_result
+            if result_job_id == job_id:
+                return status, payload
+            with self._cache_lock:
+                self._result_cache[result_job_id] = (status, payload)
+
+    def _ensure_pool(self) -> None:
         with self._pool_lock:
-            if self._pool is None:
-                self._pool = self._mp_context.Pool(
-                    processes=self.max_workers,
-                    maxtasksperchild=None,
-                )
-            return self._pool
+            if not self._workers:
+                self._start_workers()
+
+    def _start_workers(self) -> None:
+        self._task_queue = self._mp_context.Queue(maxsize=self.max_workers * 2)
+        self._result_queue = self._mp_context.Queue()
+        with self._cache_lock:
+            self._result_cache.clear()
+        self._workers = []
+        for _ in range(self.max_workers):
+            proc = self._mp_context.Process(
+                target=_worker_loop,
+                args=(self._task_queue, self._result_queue),
+                daemon=True,
+            )
+            proc.start()
+            self._workers.append(proc)
 
     def _restart_pool(self) -> None:
         with self._pool_lock:
-            if self._pool is not None:
-                self._pool.terminate()
-                self._pool.join()
-            self._pool = self._mp_context.Pool(
-                processes=self.max_workers,
-                maxtasksperchild=None,
-            )
+            self._stop_workers_locked()
+            self._start_workers()
+
+    def _stop_workers_locked(self) -> None:
+        if self._task_queue is not None:
+            for _ in self._workers:
+                try:
+                    self._task_queue.put_nowait(None)
+                except Exception:
+                    pass
+        for proc in self._workers:
+            try:
+                proc.join(timeout=1.0)
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=1.0)
+            except Exception:
+                pass
+        self._workers = []
+        if self._task_queue is not None:
+            try:
+                self._task_queue.close()
+            except Exception:
+                pass
+            self._task_queue = None
+        if self._result_queue is not None:
+            try:
+                self._result_queue.close()
+            except Exception:
+                pass
+            self._result_queue = None
+        with self._cache_lock:
+            self._result_cache.clear()
 
     def shutdown(self) -> None:
         with self._pool_lock:
-            if self._pool is not None:
-                self._pool.terminate()
-                self._pool.join()
-                self._pool = None
+            self._stop_workers_locked()
 
     def __del__(self):  # pragma: no cover - defensive cleanup
         try:
             self.shutdown()
         except Exception:
             pass
+
+
+def _worker_loop(task_queue, result_queue) -> None:
+    while True:
+        try:
+            task = task_queue.get()
+        except (EOFError, OSError):
+            break
+        if task is None:
+            break
+        if not isinstance(task, tuple) or len(task) != 5:
+            continue
+        job_id, program, inp, runs, timeout_seconds = task
+        try:
+            status, payload = _run_program_with_timeout(program, inp, runs, timeout_seconds)
+        except Exception as exc:  # pragma: no cover - defensive
+            status, payload = "err", f"Worker execution failed: {exc}"
+        try:
+            result_queue.put((job_id, status, payload))
+        except Exception as exc:  # payload not serializable
+            safe_payload = f"Failed to serialize result: {exc}"
+            try:
+                result_queue.put((job_id, "err", safe_payload))
+            except Exception:
+                pass
 
 
 def _run_program_with_timeout(
@@ -399,6 +499,10 @@ def _run_program_with_timeout(
                 if previous_handler is not None:
                     signal.signal(signal.SIGALRM, previous_handler)
 
+        try:
+            pickle.dumps(outputs)
+        except Exception as exc:
+            return "err", f"Serialization error: {exc}"
         return "ok", outputs
     except Exception:
         return "err", traceback.format_exc()
