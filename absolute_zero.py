@@ -4,6 +4,7 @@ import json
 import logging
 import random
 import re
+import inspect
 import time
 import os
 from copy import deepcopy
@@ -1335,6 +1336,37 @@ class AZREnv(Environment):
                 normalized_inputs.append(parsed)
             else:
                 normalized_inputs.append(raw_inp)
+
+        # Attempt to coerce flat tuples into a list of (name, info) pairs for single-arg functions
+        # This helps when the proposer emits "'Sammy', {..}" or "'A',{..},'B',{..}" instead of
+        # wrapping them as [(name, info), ...].
+        try:
+            sig = inspect.signature(f)
+            if len(sig.parameters) == 1:
+                coerced_inputs: List[Any] = []
+                for parsed_in in normalized_inputs:
+                    coerced_val: Any = parsed_in
+                    if isinstance(parsed_in, tuple):
+                        # Case: a single pair like ('Sammy', {...}) -> [(..., ...)]
+                        if len(parsed_in) == 2 and not (isinstance(parsed_in[0], (list, tuple)) and len(parsed_in[0]) == 2):
+                            coerced_val = [(parsed_in[0], parsed_in[1])]
+                        # Case: flat even-length tuple like ('A', {...}, 'B', {...}) -> [(A,{...}), (B,{...})]
+                        elif len(parsed_in) >= 2 and len(parsed_in) % 2 == 0:
+                            if not all(isinstance(el, (list, tuple)) and len(el) == 2 for el in parsed_in):
+                                pairs: List[Tuple[Any, Any]] = []
+                                it = iter(parsed_in)
+                                try:
+                                    while True:
+                                        first = next(it)
+                                        second = next(it)
+                                        pairs.append((first, second))
+                                except StopIteration:
+                                    pass
+                                coerced_val = pairs
+                    coerced_inputs.append(coerced_val)
+                normalized_inputs = coerced_inputs
+        except Exception:
+            pass
         io_pairs: List[Tuple[Any, Any]] = []
         failed: List[Tuple[Any, Any]] = []
         for inp in normalized_inputs:

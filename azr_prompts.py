@@ -284,6 +284,7 @@ PROPOSE_INDUCTION_PROMPT = "\n".join([
     "- For each input, format multiple arguments with commas between them",
     "- Remember to add quotes around string arguments",
     "- Each input should be individually wrapped in ```input``` tags",
+    "- If the function takes a single collection argument (e.g., a list of (name, info) pairs), pass it as one list literal like [(\'Sammy\', {\'age\': 37}), (\'Lily\', {\'age\': 32})] rather than flattening as separate arguments",
     "",
     "### Message Requirements:",
     "- Leave a message to the test subject to help them deduce the code snippet",
