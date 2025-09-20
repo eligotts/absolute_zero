@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import traceback
+from pathlib import Path
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -115,6 +116,7 @@ class AZRExecutor:
         _ = start_method  # preserved for compatibility; intentionally unused
         self.max_exec_seconds = float(max_exec_seconds)
         self.start_method = "subprocess"
+        self._worker_script = Path(__file__).with_name("azr_executor_worker.py")
 
     @classmethod
     def _static_scan(cls, program: str) -> Optional[str]:
@@ -256,9 +258,12 @@ class AZRExecutor:
             "timeout": self.max_exec_seconds,
         }
 
+        if not self._worker_script.exists():  # pragma: no cover - defensive
+            return False, None, f"Worker script not found at {self._worker_script}"
+
         try:
             completed = subprocess.run(
-                [sys.executable, "-m", "azr_executor_worker"],
+                [sys.executable, str(self._worker_script)],
                 input=pickle.dumps(job),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
