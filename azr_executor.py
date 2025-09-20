@@ -1,14 +1,15 @@
+import atexit
 import builtins as _py_builtins
 import inspect
 import math
-import pickle
+import multiprocessing as mp
+import os
 import re
 import signal
-import subprocess
-import sys
+import threading
 import traceback
-from pathlib import Path
 from copy import deepcopy
+from multiprocessing.pool import MaybeEncodingError
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # =========================
@@ -104,19 +105,50 @@ class AZRExecutor:
         self,
         max_exec_seconds: float = 5.0,
         start_method: Optional[str] = None,
+        max_workers: Optional[int] = None,
     ):
-        """Initialize the executor.
+        """Initialize the executor and worker pool.
 
-        The previous multiprocessing based implementation selected a context
-        start method here. We keep the signature for backwards compatibility,
-        but execution now happens via a dedicated helper subprocess so no
-        multiprocessing context is required.
+        We retain the ``start_method`` parameter for compatibility, but
+        execution is now delegated to a persistent process pool instead of
+        spawning a fresh interpreter per snippet. This mirrors the reference
+        Absolute-Zero-Reasoner setup and avoids repeated model re-initialisation.
         """
 
-        _ = start_method  # preserved for compatibility; intentionally unused
         self.max_exec_seconds = float(max_exec_seconds)
-        self.start_method = "subprocess"
-        self._worker_script = Path(__file__).with_name("azr_executor_worker.py")
+        self.start_method = None
+        self.max_workers = max_workers or max(1, (os.cpu_count() or 2) // 2)
+
+        requested_method = start_method or os.getenv("AZR_EXECUTOR_START_METHOD")
+        available_methods = mp.get_all_start_methods()
+        candidates: List[str] = []
+        if requested_method and requested_method in available_methods:
+            candidates.append(requested_method)
+        if not candidates:
+            if "spawn" in available_methods:
+                candidates.append("spawn")
+            if "forkserver" in available_methods:
+                candidates.append("forkserver")
+            if "fork" in available_methods:
+                candidates.append("fork")
+
+        ctx: Optional[mp.context.BaseContext] = None
+        for cand in candidates:
+            try:
+                ctx = mp.get_context(cand)
+                self.start_method = cand
+                break
+            except ValueError:
+                continue
+
+        if ctx is None:
+            ctx = mp.get_context()
+            self.start_method = ctx.get_start_method()
+
+        self._mp_context = ctx
+        self._pool: Optional[mp.pool.Pool] = None
+        self._pool_lock = threading.Lock()
+        atexit.register(self.shutdown)
 
     @classmethod
     def _static_scan(cls, program: str) -> Optional[str]:
@@ -251,46 +283,65 @@ class AZRExecutor:
     def _execute_with_timeout(
         self, program: str, inp: Any, runs: int
     ) -> Tuple[bool, Optional[List[Any]], Optional[str]]:
-        job = {
-            "program": program,
-            "input": inp,
-            "runs": runs,
-            "timeout": self.max_exec_seconds,
-        }
-
-        if not self._worker_script.exists():  # pragma: no cover - defensive
-            return False, None, f"Worker script not found at {self._worker_script}"
-
+        job = self._submit_job(program, inp, runs)
+        wait_timeout = max(self.max_exec_seconds, 0.1) + 0.5
         try:
-            completed = subprocess.run(
-                [sys.executable, str(self._worker_script)],
-                input=pickle.dumps(job),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                timeout=max(self.max_exec_seconds, 0.1) + 1.0,
-            )
-        except subprocess.TimeoutExpired:
+            status, payload = job.get(timeout=wait_timeout)
+        except mp.TimeoutError:
+            self._restart_pool()
             return False, None, "Execution timed out"
+        except MaybeEncodingError as exc:
+            self._restart_pool()
+            return False, None, f"Serialization error: {exc}"
         except Exception as exc:
-            return False, None, f"Failed to launch sandbox process: {exc}"
-
-        if completed.returncode != 0:
-            stderr = completed.stderr.decode("utf-8", "ignore").strip()
-            stdout = completed.stdout.decode("utf-8", "ignore").strip()
-            message = stderr or stdout or f"Worker exited with code {completed.returncode}"
-            return False, None, message
-
-        try:
-            status, payload = pickle.loads(completed.stdout)
-        except Exception as exc:
-            return False, None, f"Failed to decode worker response: {exc}"
+            self._restart_pool()
+            return False, None, str(exc)
 
         if status == "ok":
             return True, payload, None
         if status == "timeout":
             return False, None, "Execution timed out"
         return False, None, str(payload)
+
+    def _submit_job(self, program: str, inp: Any, runs: int):
+        pool = self._ensure_pool()
+        assert pool is not None
+        return pool.apply_async(
+            _run_program_with_timeout,
+            args=(program, inp, runs, self.max_exec_seconds),
+        )
+
+    def _ensure_pool(self) -> Optional[mp.pool.Pool]:
+        with self._pool_lock:
+            if self._pool is None:
+                self._pool = self._mp_context.Pool(
+                    processes=self.max_workers,
+                    maxtasksperchild=None,
+                )
+            return self._pool
+
+    def _restart_pool(self) -> None:
+        with self._pool_lock:
+            if self._pool is not None:
+                self._pool.terminate()
+                self._pool.join()
+            self._pool = self._mp_context.Pool(
+                processes=self.max_workers,
+                maxtasksperchild=None,
+            )
+
+    def shutdown(self) -> None:
+        with self._pool_lock:
+            if self._pool is not None:
+                self._pool.terminate()
+                self._pool.join()
+                self._pool = None
+
+    def __del__(self):  # pragma: no cover - defensive cleanup
+        try:
+            self.shutdown()
+        except Exception:
+            pass
 
 
 def _run_program_with_timeout(
@@ -353,5 +404,5 @@ def _run_program_with_timeout(
         return "err", traceback.format_exc()
 
 
-# Exported for the worker module
+# Re-export helper for process pool pickling
 __all__ = ["AZRExecutor", "_run_program_with_timeout"]
