@@ -1,10 +1,11 @@
 import builtins as _py_builtins
-import os
 import inspect
 import math
-import multiprocessing
+import pickle
 import re
 import signal
+import subprocess
+import sys
 import traceback
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -103,37 +104,17 @@ class AZRExecutor:
         max_exec_seconds: float = 5.0,
         start_method: Optional[str] = None,
     ):
+        """Initialize the executor.
+
+        The previous multiprocessing based implementation selected a context
+        start method here. We keep the signature for backwards compatibility,
+        but execution now happens via a dedicated helper subprocess so no
+        multiprocessing context is required.
+        """
+
+        _ = start_method  # preserved for compatibility; intentionally unused
         self.max_exec_seconds = float(max_exec_seconds)
-
-        requested_method = start_method or os.getenv("AZR_EXECUTOR_START_METHOD")
-        available_methods = multiprocessing.get_all_start_methods()
-
-        candidates: list[str] = []
-        if requested_method:
-            candidates.append(requested_method)
-        else:
-            if "spawn" in available_methods:
-                candidates.append("spawn")
-            if "forkserver" in available_methods and "forkserver" not in candidates:
-                candidates.append("forkserver")
-            if "fork" in available_methods:
-                candidates.append("fork")
-
-        ctx: Optional[multiprocessing.context.BaseContext] = None
-        self.start_method = None
-        for cand in candidates:
-            try:
-                ctx = multiprocessing.get_context(cand)
-                self.start_method = cand
-                break
-            except Exception:
-                continue
-
-        if ctx is None:
-            ctx = multiprocessing.get_context()
-            self.start_method = ctx.get_start_method()
-
-        self._mp_context = ctx
+        self.start_method = "subprocess"
 
     @classmethod
     def _static_scan(cls, program: str) -> Optional[str]:
@@ -268,39 +249,38 @@ class AZRExecutor:
     def _execute_with_timeout(
         self, program: str, inp: Any, runs: int
     ) -> Tuple[bool, Optional[List[Any]], Optional[str]]:
-        parent_conn, child_conn = self._mp_context.Pipe(duplex=False)
-        process = self._mp_context.Process(
-            target=_azr_executor_worker,
-            args=(child_conn, program, inp, runs, self.max_exec_seconds),
-            daemon=True,
-        )
+        job = {
+            "program": program,
+            "input": inp,
+            "runs": runs,
+            "timeout": self.max_exec_seconds,
+        }
+
         try:
-            process.start()
+            completed = subprocess.run(
+                [sys.executable, "-m", "azr_executor_worker"],
+                input=pickle.dumps(job),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=max(self.max_exec_seconds, 0.1) + 1.0,
+            )
+        except subprocess.TimeoutExpired:
+            return False, None, "Execution timed out"
         except Exception as exc:
-            child_conn.close()
-            parent_conn.close()
-            return False, None, f"Failed to start sandbox process: {exc}"
-        child_conn.close()
-        status = "timeout"
-        payload: Any = "Execution timed out"
+            return False, None, f"Failed to launch sandbox process: {exc}"
+
+        if completed.returncode != 0:
+            stderr = completed.stderr.decode("utf-8", "ignore").strip()
+            stdout = completed.stdout.decode("utf-8", "ignore").strip()
+            message = stderr or stdout or f"Worker exited with code {completed.returncode}"
+            return False, None, message
+
         try:
-            if parent_conn.poll(self.max_exec_seconds):
-                try:
-                    status, payload = parent_conn.recv()
-                except EOFError:
-                    status, payload = "err", "Sandbox exited without returning a result"
-            elif not process.is_alive():
-                status, payload = "err", "Sandbox exited without returning a result"
-        finally:
-            parent_conn.close()
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=0.5)
-            if process.is_alive():
-                kill = getattr(process, "kill", None)
-                if callable(kill):
-                    kill()
-                process.join(timeout=0.5)
+            status, payload = pickle.loads(completed.stdout)
+        except Exception as exc:
+            return False, None, f"Failed to decode worker response: {exc}"
+
         if status == "ok":
             return True, payload, None
         if status == "timeout":
@@ -308,12 +288,17 @@ class AZRExecutor:
         return False, None, str(payload)
 
 
-def _azr_executor_worker(conn, program: str, inp: Any, runs: int, timeout_seconds: float) -> None:
+def _run_program_with_timeout(
+    program: str,
+    inp: Any,
+    runs: int,
+    timeout_seconds: Optional[float],
+) -> Tuple[str, Any]:
     try:
         err = AZRExecutor._static_scan(program)
         if err:
-            conn.send(("err", err))
-            return
+            return "err", err
+
         safe_globals: Dict[str, Any] = {
             "__builtins__": AZRExecutor.ALLOWED_BUILTINS,
             "__build_class__": _py_builtins.__build_class__,
@@ -323,12 +308,13 @@ def _azr_executor_worker(conn, program: str, inp: Any, runs: int, timeout_second
         exec(program, safe_globals, safe_globals)
         f = AZRExecutor._discover_callable(safe_globals)
         if f is None:
-            conn.send(("err", "No callable function found (expected def f(...): ...)"))
-            return
+            return "err", "No callable function found (expected def f(...): ...)"
+
         max_runs = max(2, runs)
         timer_supported = hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer")
         per_run_timeout = None
         use_timer = False
+        previous_handler = None
         if timeout_seconds and timeout_seconds > 0 and timer_supported:
             per_run_timeout = max(timeout_seconds / max_runs, 0.01)
             use_timer = True
@@ -336,25 +322,31 @@ def _azr_executor_worker(conn, program: str, inp: Any, runs: int, timeout_second
             def _raise_timeout(signum, frame):  # type: ignore[unused-argument]
                 raise _ExecutionTimeout(f"Execution exceeded {per_run_timeout:.2f}s budget")
 
+            previous_handler = signal.getsignal(signal.SIGALRM)
             signal.signal(signal.SIGALRM, _raise_timeout)
 
         outputs: List[Any] = []
-        for _ in range(max_runs):
-            if use_timer and per_run_timeout is not None:
-                signal.setitimer(signal.ITIMER_REAL, per_run_timeout)
-            try:
-                outputs.append(AZRExecutor._call_function(f, deepcopy(inp)))
-            except _ExecutionTimeout as exc:
-                conn.send(("timeout", str(exc)))
-                return
-            finally:
-                if use_timer:
-                    signal.setitimer(signal.ITIMER_REAL, 0.0)
-        conn.send(("ok", outputs))
-    except Exception:
-        conn.send(("err", traceback.format_exc()))
-    finally:
         try:
-            conn.close()
-        except Exception:
-            pass
+            for _ in range(max_runs):
+                if use_timer and per_run_timeout is not None:
+                    signal.setitimer(signal.ITIMER_REAL, per_run_timeout)
+                try:
+                    outputs.append(AZRExecutor._call_function(f, deepcopy(inp)))
+                except _ExecutionTimeout as exc:
+                    return "timeout", str(exc)
+                finally:
+                    if use_timer:
+                        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        finally:
+            if use_timer:
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                if previous_handler is not None:
+                    signal.signal(signal.SIGALRM, previous_handler)
+
+        return "ok", outputs
+    except Exception:
+        return "err", traceback.format_exc()
+
+
+# Exported for the worker module
+__all__ = ["AZRExecutor", "_run_program_with_timeout"]
