@@ -707,6 +707,11 @@ class AZREnv(Environment):
                 "oai_tools": oai_tools,
                 "message_type": self.message_type,
             },
+            "timing": {
+                "generation_ms": 0.0,
+                "scoring_ms": 0.0,
+                "total_ms": 0.0,
+            },
         }
 
         # Parse answer based on fenced-block formats (no JSON expected)
