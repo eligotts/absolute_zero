@@ -886,7 +886,7 @@ class AZREnv(Environment):
         This mirrors the Absolute-Zero seeding approach at a high level, adapted to this environment.
         """
         # Determine targets
-        desired_triplets = int(target_triplets) if target_triplets is not None else max(4 * self.K, 32)
+        desired_triplets = int(target_triplets) if target_triplets is not None else min(4 * self.K, 16)
         desired_induction = int(target_induction) if target_induction is not None else desired_triplets
 
         # Common info for rollouts
@@ -1040,7 +1040,7 @@ class AZREnv(Environment):
     # -------- Auto-seeding helpers --------
 
     def _desired_seed_targets(self, target_triplets: Optional[int] = None, target_induction: Optional[int] = None) -> tuple[int, int]:
-        desired_triplets = int(target_triplets) if target_triplets is not None else min(4 * self.K, 4)
+        desired_triplets = int(target_triplets) if target_triplets is not None else min(4 * self.K, 16)
         desired_induction = int(target_induction) if target_induction is not None else desired_triplets
         return desired_triplets, desired_induction
 
