@@ -11,7 +11,7 @@ from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 from azr_utils.azr_parser import AZRXMLParser
 from azr_utils.azr_executor import AZRExecutor
-from azr_utils.azr_buffers import AZRBufferManager, Triplet, DeductionItem, AbductionItem, InductionItem, preload_buffers
+from azr_utils.azr_buffers import AZRBufferManager, Triplet, DeductionItem, AbductionItem, InductionItem
 from datasets import Dataset
 from openai import AsyncOpenAI
 
@@ -428,7 +428,7 @@ class AZREnv(Environment):
         determinism_runs: int = 2,
         seed: int = 1337420,
         init_zero_triplet: bool = True,
-        verbose: bool = True,
+        verbose: bool = False,
         exec_timeout: float = 20.0,
         **kwargs,
     ):
@@ -561,7 +561,6 @@ class AZREnv(Environment):
         oai_tools = info.get("oai_tools", None)
 
         # Auto-seed guard: ensure buffers are populated before proceeding,
-        # unless explicitly bypassed (when called from seed_buffers itself).
         bypass_auto_seed = bool(info.get("_bypass_seeding", False))
         if not bypass_auto_seed:
             await self._ensure_seeded_if_needed(
@@ -1512,9 +1511,6 @@ def _make_azr_dataset(
     return Dataset.from_list(rows)
 
 
-_AZR_SEED_WARN_ONCE = False
-
-
 def load_environment(
     # number of monte carlo samples to use for propose tasks (getting rewards)
     mc_samples: int = 6,
@@ -1527,12 +1523,8 @@ def load_environment(
     system_prompt: str = BASE_SYSTEM_PROMPT,
     init_zero_triplet: bool = True,
     dataset_repeats: int = 1000,
-    # Seeding controls
-    seed_buffers: bool = True,
-    # Hardcoded preload option for deterministic, client-free seeding
-    preload_buffers_hardcoded: bool = False,
     # Verbose printing control
-    verbose: bool = True,
+    verbose: bool = False,
     exec_timeout: float = 20.0,
 ) -> vf.Environment:
     """
@@ -1558,19 +1550,4 @@ def load_environment(
         verbose=verbose,
         exec_timeout=exec_timeout,
     )
-    # Optionally pre-seed buffers synchronously (caller can also call env.seed_buffers asynchronously)
-    if seed_buffers:
-        global _AZR_SEED_WARN_ONCE
-        if not _AZR_SEED_WARN_ONCE:
-            _AZR_SEED_WARN_ONCE = True
-            env.logger.warning("seed_buffers=True passed, but seeding requires an AsyncOpenAI client and model."
-                              " Call await env.seed_buffers(client, model, target_triplets=..., target_induction=...) after constructing the env.")
-
-    # Attach a simple rubric (already inside AZREnv via AZRRubric)
-    if preload_buffers_hardcoded:
-        try:
-            preload_buffers(env)
-            env.logger.info("Buffers preloaded with hardcoded triplets/inductions (3/3).")
-        except Exception as exc:
-            env.logger.exception("Failed to preload buffers: %s", exc)
     return env
