@@ -84,6 +84,7 @@ CODE_FUNCTION_PREDICTOR_PROMPT = "\n".join([
     "  * Import statements (NO imports allowed - use only built-in functions)",
     "- Ensure execution completes within 10 seconds on a modern CPU",
     "- Custom classes are allowed and should be defined at the very top of the code snippet",
+    "- Return only built-in Python types (ints, floats, bools, strings, lists, tuples, dicts); never return instances of custom classes",
     "- NO import statements of any kind - only use built-in functions like abs, len, max, min, sum, etc.",
     "- The snippet should end with a return statement from the main function `f()`, anything after will be removed",
     "",
@@ -126,6 +127,7 @@ PROPOSE_DEDUCTION_PROMPT = "\n".join([
     "  * Import statements (NO imports allowed - use only built-in functions)",
     "- Ensure execution completes within 10 seconds on a modern CPU",
     "- Custom classes are allowed and should be defined at the very top of the code snippet",
+    "- Return only built-in Python types (ints, floats, bools, strings, lists, tuples, dicts); never return instances of custom classes",
     "- NO import statements of any kind - only use built-in functions like abs, len, max, min, sum, etc.",
     "- The snippet should end with a return statement from the main function `f`, anything after will be removed",
     "### Input Requirements:",
@@ -210,6 +212,7 @@ PROPOSE_ABDUCTION_PROMPT = "\n".join([
     "  * Import statements (NO imports allowed - use only built-in functions)",
     "- Ensure execution completes within 10 seconds on a modern CPU",
     "- Custom classes are allowed and should be defined at the very top of the code snippet",
+    "- Return only built-in Python types (ints, floats, bools, strings, lists, tuples, dicts); never return instances of custom classes",
     "- NO import statements of any kind - only use built-in functions like abs, len, max, min, sum, etc.",
     "- The snippet should end with a return statement from the main function `f`, anything after will be removed",
     "### Input Requirements:",
@@ -281,6 +284,7 @@ PROPOSE_INDUCTION_PROMPT = "\n".join([
     "- For each input, format multiple arguments with commas between them",
     "- Remember to add quotes around string arguments",
     "- Each input should be individually wrapped in ```input``` tags",
+    # "- If the function takes a single collection argument (e.g., a list of (name, info) pairs), pass it as one list literal like [(\'Sammy\', {\'age\': 37}), (\'Lily\', {\'age\': 32})] rather than flattening as separate arguments",
     "",
     "### Message Requirements:",
     "- Leave a message to the test subject to help them deduce the code snippet",
@@ -328,5 +332,4 @@ PROPOSE_INDUCTION_PROMPT = "\n".join([
     "(repeat ```input``` blocks {num_inputs} times)",
     "</answer>",
 ])
-
 
