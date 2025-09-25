@@ -429,7 +429,7 @@ class AZREnv(Environment):
         seed: int = 1337420,
         init_zero_triplet: bool = True,
         verbose: bool = False,
-        exec_timeout: float = 20.0,
+        exec_timeout: float = 10.0,
         **kwargs,
     ):
         self.logger = logging.getLogger("AZREnv")
@@ -1525,7 +1525,7 @@ def load_environment(
     dataset_repeats: int = 1000,
     # Verbose printing control
     verbose: bool = False,
-    exec_timeout: float = 20.0,
+    exec_timeout: float = 10.0,
 ) -> vf.Environment:
     """
     Factory returning an AZREnv instance.
