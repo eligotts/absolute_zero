@@ -1,9 +1,10 @@
-import logging
 import random
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
+
+from azr_utils.azr_logging import get_logger
 
 # =========================
 # Data classes and buffers
@@ -42,8 +43,6 @@ class InductionItem:
     hidden_pairs: List[Tuple[Any, Any]]
     step_id: int
     created_at: float
-
-
 class AZRBufferManager:
     """
     Holds:
@@ -54,8 +53,8 @@ class AZRBufferManager:
     Provides recency-biased sampling.
     """
 
-    def __init__(self, seed: int = 1337420, init_zero_triplet: bool = True):
-        self.logger = logging.getLogger("AZRBufferManager")
+    def __init__(self, seed: int = 1337420, init_zero_triplet: bool = True, enable_logging: bool = False):
+        self.logger = get_logger(enable_logging, "AZRBufferManager")
         # Use a local PRNG to avoid affecting global randomness elsewhere
         self.rng = random.Random(seed)
         self.lock = threading.Lock()

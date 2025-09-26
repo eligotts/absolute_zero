@@ -15,6 +15,8 @@ from pathlib import Path
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from azr_utils.azr_logging import get_logger
+
 
 # =========================
 # Safe Python executor
@@ -124,10 +126,13 @@ class AZRExecutor:
         max_exec_seconds: float = 5.0,
         start_method: Optional[str] = None,
         max_workers: Optional[int] = None,
+        enable_logging: bool = False,
     ):
         """Initialize the executor and a capped pool of worker subprocesses."""
 
         _ = start_method  # preserved for compatibility; intentionally unused
+        self.enable_logging = enable_logging
+        self.logger = get_logger(self.enable_logging, "AZRExecutor")
         self.max_exec_seconds = float(max_exec_seconds)
         self.start_method = "subprocess"
         self._worker_script = Path(__file__).with_name("azr_executor_worker.py")
@@ -263,6 +268,8 @@ class AZRExecutor:
         self, program: str, inp: Any, runs: int
     ) -> Tuple[bool, Optional[List[Any]], Optional[str]]:
         if not self._worker_script.exists():  # pragma: no cover - defensive
+            if self.enable_logging:
+                self.logger.warning("Worker script missing at %s", self._worker_script)
             return False, None, f"Worker script not found at {self._worker_script}"
 
         payload = {

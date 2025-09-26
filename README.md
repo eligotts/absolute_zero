@@ -54,6 +54,7 @@ Notes:
 | `init_zero_triplet` | bool | `True` | Start buffers with an identity triplet if empty. |
 | `dataset_repeats` | int | `1000` | Total rows = `6 * dataset_repeats`. |
 | `verbose` | bool | `False` | Print prompts/responses and seeding logs. |
+| `enable_logging` | bool | `False` | Enable logging to `azr_runs.log`. |
 | `exec_timeout` | float | `10.0` | Max seconds for sandboxed code execution. |
 
 Notes

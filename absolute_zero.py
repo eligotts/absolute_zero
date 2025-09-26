@@ -3,7 +3,6 @@ import ast
 import json
 import logging
 import random
-import re
 import inspect
 import time
 import os
@@ -12,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from azr_utils.azr_parser import AZRXMLParser
 from azr_utils.azr_executor import AZRExecutor
 from azr_utils.azr_buffers import AZRBufferManager, Triplet, DeductionItem, AbductionItem, InductionItem
+from azr_utils.azr_logging import ensure_run_logger, get_logger
 from datasets import Dataset
 from openai import AsyncOpenAI
 
@@ -36,17 +36,9 @@ from azr_utils.azr_prompts import (
 
 AZR_LOG_FILE = os.getenv("AZR_LOG_FILE", "azr_runs.log")
 
-def _ensure_run_logger() -> logging.Logger:
-    logger = logging.getLogger("AZRRunLog")
-    if not any(isinstance(h, logging.FileHandler) and getattr(h, "_azr_is_run_log", False) for h in logger.handlers):
-        fh = logging.FileHandler(AZR_LOG_FILE, encoding="utf-8")
-        fh.setLevel(logging.INFO)
-        setattr(fh, "_azr_is_run_log", True)
-        fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
-    logger.setLevel(logging.INFO)
-    return logger
+
+def _ensure_run_logger(enable_logging: bool):
+    return ensure_run_logger(enable_logging, AZR_LOG_FILE)
 
 
 # =========================
@@ -54,11 +46,18 @@ def _ensure_run_logger() -> logging.Logger:
 # =========================
 
 class AZRRubric(Rubric):
-    def __init__(self, parser: Optional[AZRXMLParser] = None, executor: Optional[AZRExecutor] = None, exec_timeout: float = 20.0):
+    def __init__(
+        self,
+        parser: Optional[AZRXMLParser] = None,
+        executor: Optional[AZRExecutor] = None,
+        exec_timeout: float = 20.0,
+        enable_logging: bool = False,
+    ):
+        self.enable_logging = enable_logging
         self.azr_parser = parser or AZRXMLParser()
-        self.executor = executor or AZRExecutor(max_exec_seconds=exec_timeout)
+        self.executor = executor or AZRExecutor(max_exec_seconds=exec_timeout, enable_logging=enable_logging)
         super().__init__(funcs=[self.azr_reward], weights=[1.0], parser=self.azr_parser)
-        self.run_logger = _ensure_run_logger()
+        self.run_logger = _ensure_run_logger(self.enable_logging)
 
     @staticmethod
     def _parse_literal_maybe_tuple(content: str) -> Tuple[bool, Optional[Any]]:
@@ -82,6 +81,7 @@ class AZRRubric(Rubric):
                 pass
         return False, None
 
+    # The monte carlo model call for propose task reward computation
     async def _mc_model_call(
         self,
         client: AsyncOpenAI,
@@ -161,20 +161,23 @@ class AZRRubric(Rubric):
                 if ok:
                     pred_out, parsed_ok = val, True
             try:
-                self.run_logger.info(json.dumps({
-                    "mc_task": "deduction.propose monte carlo rollout solver",
-                    "sample_index": idx,
-                    "format_ok": parsed_ok,
-                    "prediction": pred_out,
-                    "gold_output": gold_out,
-                    "raw_response_preview": None if parsed_ok else txt[:1200],
-                }))
+                if self.enable_logging:
+                    self.run_logger.info(json.dumps({
+                        "mc_task": "deduction.propose monte carlo rollout solver",
+                        "sample_index": idx,
+                        "format_ok": parsed_ok,
+                        "prediction": pred_out,
+                        "gold_output": gold_out,
+                        "raw_response_preview": None if parsed_ok else txt[:1200],
+                    }))
             except Exception:
                 pass
             return 1 if (parsed_ok and pred_out == gold_out) else 0
 
         if mc_samples <= 0:
             return 0.0
+
+        # Run the monte carlo samples in parallel
         results = await asyncio.gather(*[asyncio.create_task(run_one(i)) for i in range(mc_samples)])
         correct = sum(int(x) for x in results)
         return correct / float(mc_samples)
@@ -204,15 +207,16 @@ class AZRRubric(Rubric):
                 if ok:
                     pred_in, parsed_ok = val, True
             try:
-                self.run_logger.info(json.dumps({
-                    "mc_task": "abduction.propose monte carlo rollout solver",
-                    "sample_index": idx,
-                    "format_ok": parsed_ok,
-                    "prediction": pred_in,
-                    "program_preview": program[:120] if isinstance(program, str) else None,
-                    "gold_output": gold_out,
-                    "raw_response_preview": None if parsed_ok else txt[:1200],
-                }))
+                if self.enable_logging:
+                    self.run_logger.info(json.dumps({
+                        "mc_task": "abduction.propose monte carlo rollout solver",
+                        "sample_index": idx,
+                        "format_ok": parsed_ok,
+                        "prediction": pred_in,
+                        "program_preview": program[:120] if isinstance(program, str) else None,
+                        "gold_output": gold_out,
+                        "raw_response_preview": None if parsed_ok else txt[:1200],
+                    }))
             except Exception:
                 pass
             ok = parsed_ok and self.executor.eval_abduction_input(
@@ -222,6 +226,7 @@ class AZRRubric(Rubric):
 
         if mc_samples <= 0:
             return 0.0
+        # Run the monte carlo samples in parallel
         results = await asyncio.gather(*[asyncio.create_task(run_one(i)) for i in range(mc_samples)])
         correct = sum(int(x) for x in results)
         return correct / float(mc_samples)
@@ -251,14 +256,15 @@ class AZRRubric(Rubric):
                 program_src = pys[0]
                 parsed_ok = True
             try:
-                self.run_logger.info(json.dumps({
-                    "mc_task": "induction.propose monte carlo rollout solver",
-                    "sample_index": idx,
-                    "format_ok": parsed_ok,
-                    "program_preview": program_src[:200] if isinstance(program_src, str) else None,
-                    "hidden_pairs": hidden_pairs,
-                    "raw_response_preview": None if parsed_ok else txt[:1200],
-                }))
+                if self.enable_logging:
+                    self.run_logger.info(json.dumps({
+                        "mc_task": "induction.propose monte carlo rollout solver",
+                        "sample_index": idx,
+                        "format_ok": parsed_ok,
+                        "program_preview": program_src[:200] if isinstance(program_src, str) else None,
+                        "hidden_pairs": hidden_pairs,
+                        "raw_response_preview": None if parsed_ok else txt[:1200],
+                    }))
             except Exception:
                 pass
             ok = isinstance(program_src, str) and self.executor.eval_program_on_pairs(
@@ -268,6 +274,7 @@ class AZRRubric(Rubric):
 
         if mc_samples <= 0:
             return 0.0
+        # Run the monte carlo samples in parallel
         results = await asyncio.gather(*[asyncio.create_task(run_one(i)) for i in range(mc_samples)])
         correct = sum(int(x) for x in results)
         return correct / float(mc_samples)
@@ -298,6 +305,7 @@ class AZRRubric(Rubric):
         oai_tools = runtime.get("oai_tools")
         message_type = runtime.get("message_type", "chat")
         # Propose vs Solve
+        # Propose tasks are evaluated using monte carlo samples
         if task.endswith(".propose"):
             # Ensure MC accuracy is computed here if missing
             valid = bool(state.get("valid", False))
@@ -366,6 +374,7 @@ class AZRRubric(Rubric):
             if mc_f <= 0.0 or mc_f >= 1.0:
                 return 0.0
             return 1.0 - mc_f
+        # Solve tasks are evaluated using correctness
         else:
             # Ensure correctness is computed here if missing
             solve = state.get("solve", {}) or {}
@@ -430,12 +439,14 @@ class AZREnv(Environment):
         init_zero_triplet: bool = True,
         verbose: bool = False,
         exec_timeout: float = 10.0,
+        enable_logging: bool = False,
         **kwargs,
     ):
-        self.logger = logging.getLogger("AZREnv")
+        self.enable_logging = enable_logging
+        self.logger = get_logger(enable_logging, "AZREnv")
         self.azr_parser = AZRXMLParser()
-        self.executor = AZRExecutor(max_exec_seconds=exec_timeout)
-        self.rubric_impl = AZRRubric(parser=self.azr_parser, executor=self.executor, exec_timeout=exec_timeout)
+        self.executor = AZRExecutor(max_exec_seconds=exec_timeout, enable_logging=enable_logging)
+        self.rubric_impl = AZRRubric(parser=self.azr_parser, executor=self.executor, exec_timeout=exec_timeout, enable_logging=enable_logging)
         super().__init__(
             dataset=dataset,
             system_prompt=None,  # prompts are pre-formatted with system message
@@ -445,7 +456,7 @@ class AZREnv(Environment):
             **kwargs,
         )
         random.seed(seed)
-        self.buffers = AZRBufferManager(seed=seed, init_zero_triplet=init_zero_triplet)
+        self.buffers = AZRBufferManager(seed=seed, init_zero_triplet=init_zero_triplet, enable_logging=enable_logging)
         # number of monte carlo samples to use for propose tasks
         self.mc_samples = mc_samples
         # number of references to use for propose tasks
@@ -634,37 +645,39 @@ class AZREnv(Environment):
 
         # Print prompt being sent to model
         if self.verbose:
-            try:
-                print(f"\n[PROMPT TO MODEL] task={task}")
-                print("=" * 60)
-                for i, msg in enumerate(rollout_messages):
-                    role = msg.get("role", "unknown")
-                    content = msg.get("content", "")
-                    print(f"Message {i+1} ({role}):")
-                    print(content)
-                    print("-" * 40)
-                print("=" * 60)
-                print(f"[END PROMPT]\n")
-            except Exception:
-                pass
+            if self.enable_logging:
+                try:
+                    print(f"\n[PROMPT TO MODEL] task={task}")
+                    print("=" * 60)
+                    for i, msg in enumerate(rollout_messages):
+                        role = msg.get("role", "unknown")
+                        content = msg.get("content", "")
+                        print(f"Message {i+1} ({role}):")
+                        print(content)
+                        print("-" * 40)
+                    print("=" * 60)
+                    print(f"[END PROMPT]\n")
+                except Exception:
+                    pass
 
         # Call model for main role
-        run_logger = _ensure_run_logger()
+        run_logger = _ensure_run_logger(self.enable_logging)
         is_seeding_phase = bool(info.get("_bypass_seeding", False))
-        try:
-            if is_seeding_phase:
-                phase = "rollout_request_seeding"
-            else:
-                phase = "rollout_request"
-            run_logger.info(json.dumps({
-                "phase": phase,
-                "task": task,
-                "messages": rollout_messages,
-                "info": info,
-                "is_seeding": is_seeding_phase,
-            }))
-        except Exception:
-            pass
+        if self.enable_logging:
+            try:
+                if is_seeding_phase:
+                    phase = "rollout_request_seeding"
+                else:
+                    phase = "rollout_request"
+                run_logger.info(json.dumps({
+                    "phase": phase,
+                    "task": task,
+                    "messages": rollout_messages,
+                    "info": info,
+                    "is_seeding": is_seeding_phase,
+                }))
+            except Exception:
+                pass
         response = await self.get_model_response(
             client=client,
             model=model,
@@ -675,19 +688,20 @@ class AZREnv(Environment):
         )
         assistant_text = response.choices[0].message.content or ""
         completion: Messages = [{"role": "assistant", "content": assistant_text}]
-        try:
-            if is_seeding_phase:
-                phase = "rollout_response_seeding"
-            else:
-                phase = "rollout_response"
-            run_logger.info(json.dumps({
-                "phase": phase,
-                "task": task,
-                "assistant_text": assistant_text[:4000],
-                "is_seeding": is_seeding_phase,
-            }))
-        except Exception:
-            pass
+        if self.enable_logging:
+            try:
+                if is_seeding_phase:
+                    phase = "rollout_response_seeding"
+                else:
+                    phase = "rollout_response"
+                run_logger.info(json.dumps({
+                    "phase": phase,
+                    "task": task,
+                    "assistant_text": assistant_text[:4000],
+                    "is_seeding": is_seeding_phase,
+                }))
+            except Exception:
+                pass
 
         # Initialize state
         state: State = {
@@ -759,9 +773,9 @@ class AZREnv(Environment):
         state["json_ok"] = json_obj is not None
         state["error"] = parse_err
         # Log parsing exceptions to azr_runs.log
-        if parse_err:
+        if parse_err and self.enable_logging:
             try:
-                run_logger = _ensure_run_logger()
+                run_logger = _ensure_run_logger(self.enable_logging)
                 run_logger.error(json.dumps({
                     "phase": "rollout_parse_error",
                     "task": task,
@@ -772,18 +786,21 @@ class AZREnv(Environment):
             except Exception:
                 pass
         # Diagnostics for rollout formatting
-        try:
-            self.logger.info(
-                f"[ROLL] task={task} format_ok={state['format_ok']} json_ok={state['json_ok']} error={(parse_err or '')[:80]}"
-            )
-            # Print raw model response for debugging
-            if self.verbose:
+        if self.enable_logging:
+            try:
+                self.logger.info(
+                    f"[ROLL] task={task} format_ok={state['format_ok']} json_ok={state['json_ok']} error={(parse_err or '')[:80]}"
+                )
+            except Exception:
+                pass
+        if self.verbose:
+            try:
                 print(f"\n[RAW MODEL RESPONSE] task={task}")
                 print(f"Response length: {len(assistant_text)} chars")
                 print(f"Response content:\n{assistant_text}")
                 print(f"[END RAW RESPONSE]\n")
-        except Exception:
-            pass
+            except Exception:
+                pass
         state["payload"] = {
             "program": None,
             "input": None,
@@ -901,12 +918,13 @@ class AZREnv(Environment):
         }
 
         # Seeding summary header
-        try:
-            self.logger.info(
-                f"[SEED] start triplets={len(self.buffers.triplet_set)}->{desired_triplets} induction={len(self.buffers.induction)}->{desired_induction} K={self.K} mc={self.mc_samples} j={self.j}"
-            )
-        except Exception:
-            pass
+        if self.enable_logging:
+            try:
+                self.logger.info(
+                    f"[SEED] start triplets={len(self.buffers.triplet_set)}->{desired_triplets} induction={len(self.buffers.induction)}->{desired_induction} K={self.K} mc={self.mc_samples} j={self.j}"
+                )
+            except Exception:
+                pass
 
         # Stage 1: Seed triplets using propose tasks in parallel chunks
         need_triplets = max(0, desired_triplets - len(self.buffers.triplet_set))
@@ -1030,12 +1048,13 @@ class AZREnv(Environment):
                     break
                 remaining = need_ind - successes_total
 
-        try:
-            self.logger.info(
-                f"[SEED DONE] triplets={len(self.buffers.triplet_set)} induction={len(self.buffers.induction)}"
-            )
-        except Exception:
-            pass
+        if self.enable_logging:
+            try:
+                self.logger.info(
+                    f"[SEED DONE] triplets={len(self.buffers.triplet_set)} induction={len(self.buffers.induction)}"
+                )
+            except Exception:
+                pass
 
     # -------- Auto-seeding helpers --------
 
@@ -1107,12 +1126,13 @@ class AZREnv(Environment):
                     pass
 
             # Perform seeding outside the lock (so rollouts called by seeding can run)
-            try:
-                self.logger.info(
-                    f"[AUTO-SEED] starting: have triplets={len(self.buffers.triplet_set)} induction={len(self.buffers.induction)} target=({triplet_goal},{induction_goal})"
-                )
-            except Exception:
-                pass
+            if self.enable_logging:
+                try:
+                    self.logger.info(
+                        f"[AUTO-SEED] starting: have triplets={len(self.buffers.triplet_set)} induction={len(self.buffers.induction)} target=({triplet_goal},{induction_goal})"
+                    )
+                except Exception:
+                    pass
             try:
                 await self.seed_buffers(
                     client=client,
@@ -1152,51 +1172,53 @@ class AZREnv(Environment):
         # Validate program + input => output
         f, err = self.executor.compile_program(program)
         if f is None:
-            try:
-                self.logger.info(f"[PROPOSE FAIL] deduction.propose compile error: {err}")
-            except Exception:
-                pass
-            # Also log error to azr_runs.log
-            try:
-                run_logger = _ensure_run_logger()
-                run_logger.error(json.dumps({
-                    "phase": "propose_compile_error",
-                    "task": "deduction.propose",
-                    "error": err,
-                    "program_preview": (program[:200] if isinstance(program, str) else None),
-                }))
-            except Exception:
-                pass
+            if self.enable_logging:
+                try:
+                    self.logger.info(f"[PROPOSE FAIL] deduction.propose compile error: {err}")
+                except Exception:
+                    pass
+                # Also log error to azr_runs.log
+                try:
+                    run_logger = _ensure_run_logger(self.enable_logging)
+                    run_logger.error(json.dumps({
+                        "phase": "propose_compile_error",
+                        "task": "deduction.propose",
+                        "error": err,
+                        "program_preview": (program[:200] if isinstance(program, str) else None),
+                    }))
+                except Exception:
+                    pass
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": err}, payload
         ok, out, err2 = self.executor.run_deterministic(f, inp, runs=determinism_runs)
         if not ok:
-            try:
-                self.logger.info(f"[PROPOSE FAIL] deduction.propose execution error: {err2}")
-            except Exception:
-                pass
-            # Also log error to azr_runs.log
-            try:
-                run_logger = _ensure_run_logger()
-                run_logger.error(json.dumps({
-                    "phase": "propose_exec_error",
-                    "task": "deduction.propose",
-                    "error": err2,
-                    "program_preview": (program[:200] if isinstance(program, str) else None),
-                    "input_preview": repr(inp)[:120],
-                }))
-            except Exception:
-                pass
+            if self.enable_logging:
+                try:
+                    self.logger.info(f"[PROPOSE FAIL] deduction.propose execution error: {err2}")
+                except Exception:
+                    pass
+                try:
+                    run_logger = _ensure_run_logger(self.enable_logging)
+                    run_logger.error(json.dumps({
+                        "phase": "propose_exec_error",
+                        "task": "deduction.propose",
+                        "error": err2,
+                        "program_preview": (program[:200] if isinstance(program, str) else None),
+                        "input_preview": repr(inp)[:120],
+                    }))
+                except Exception:
+                    pass
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": err2}, payload
         payload["output"] = out
         # Add to buffers
         step_id = self.buffers.add_triplet(program, inp, out)
-        try:
-            prog_preview = (program[:60] + "…") if isinstance(program, str) and len(program or "") > 60 else program
-            self.logger.info(
-                f"[PROPOSE OK] deduction.propose step_id={step_id} input={repr(inp)[:40]} output={repr(out)[:40]} program_preview={repr(prog_preview)} total_triplets={len(self.buffers.triplet_set)}"
-            )
-        except Exception:
-            pass
+        if self.enable_logging:
+            try:
+                prog_preview = (program[:60] + "…") if isinstance(program, str) and len(program or "") > 60 else program
+                self.logger.info(
+                    f"[PROPOSE OK] deduction.propose step_id={step_id} input={repr(inp)[:40]} output={repr(out)[:40]} program_preview={repr(prog_preview)} total_triplets={len(self.buffers.triplet_set)}"
+                )
+            except Exception:
+                pass
         # Defer MC solver accuracy to rubric stage
         return True, {"mc_samples": mc_samples, "mc_accuracy": None}, payload
 
@@ -1217,50 +1239,51 @@ class AZREnv(Environment):
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": "Program is not a string"}, payload
         f, err = self.executor.compile_program(program)
         if f is None:
-            try:
-                self.logger.info(f"[PROPOSE FAIL] abduction.propose compile error: {err}")
-            except Exception:
-                pass
-            # Also log error to azr_runs.log
-            try:
-                run_logger = _ensure_run_logger()
-                run_logger.error(json.dumps({
-                    "phase": "propose_compile_error",
-                    "task": "abduction.propose",
-                    "error": err,
-                    "program_preview": (program[:200] if isinstance(program, str) else None),
-                }))
-            except Exception:
-                pass
+            if self.enable_logging:
+                try:
+                    self.logger.info(f"[PROPOSE FAIL] abduction.propose compile error: {err}")
+                except Exception:
+                    pass
+                try:
+                    run_logger = _ensure_run_logger(self.enable_logging)
+                    run_logger.error(json.dumps({
+                        "phase": "propose_compile_error",
+                        "task": "abduction.propose",
+                        "error": err,
+                        "program_preview": (program[:200] if isinstance(program, str) else None),
+                    }))
+                except Exception:
+                    pass
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": err}, payload
         ok, out, err2 = self.executor.run_deterministic(f, inp, runs=determinism_runs)
         if not ok:
-            try:
-                self.logger.info(f"[PROPOSE FAIL] abduction.propose execution error: {err2}")
-            except Exception:
-                pass
-            # Also log error to azr_runs.log
-            try:
-                run_logger = _ensure_run_logger()
-                run_logger.error(json.dumps({
-                    "phase": "propose_exec_error",
-                    "task": "abduction.propose",
-                    "error": err2,
-                    "program_preview": (program[:200] if isinstance(program, str) else None),
-                    "input_preview": repr(inp)[:120],
-                }))
-            except Exception:
-                pass
+            if self.enable_logging:
+                try:
+                    self.logger.info(f"[PROPOSE FAIL] abduction.propose execution error: {err2}")
+                except Exception:
+                    pass
+                try:
+                    run_logger = _ensure_run_logger(self.enable_logging)
+                    run_logger.error(json.dumps({
+                        "phase": "propose_exec_error",
+                        "task": "abduction.propose",
+                        "error": err2,
+                        "program_preview": (program[:200] if isinstance(program, str) else None),
+                        "input_preview": repr(inp)[:120],
+                    }))
+                except Exception:
+                    pass
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": err2}, payload
         payload["output"] = out
         step_id = self.buffers.add_triplet(program, inp, out)
-        try:
-            prog_preview = (program[:60] + "…") if isinstance(program, str) and len(program or "") > 60 else program
-            self.logger.info(
-                f"[PROPOSE OK] abduction.propose step_id={step_id} input={repr(inp)[:40]} output={repr(out)[:40]} program_preview={repr(prog_preview)} total_triplets={len(self.buffers.triplet_set)}"
-            )
-        except Exception:
-            pass
+        if self.enable_logging:
+            try:
+                prog_preview = (program[:60] + "…") if isinstance(program, str) and len(program or "") > 60 else program
+                self.logger.info(
+                    f"[PROPOSE OK] abduction.propose step_id={step_id} input={repr(inp)[:40]} output={repr(out)[:40]} program_preview={repr(prog_preview)} total_triplets={len(self.buffers.triplet_set)}"
+                )
+            except Exception:
+                pass
         # Defer MC solver accuracy to rubric stage
         return True, {"mc_samples": mc_samples, "mc_accuracy": None}, payload
 
@@ -1285,17 +1308,17 @@ class AZREnv(Environment):
         # Validate inputs against program: compute outputs
         f, err = self.executor.compile_program(program_context)
         if f is None:
-            # Log compile error
-            try:
-                run_logger = _ensure_run_logger()
-                run_logger.error(json.dumps({
-                    "phase": "propose_compile_error",
-                    "task": "induction.propose",
-                    "error": err,
-                    "program_preview": (program_context[:200] if isinstance(program_context, str) else None),
-                }))
-            except Exception:
-                pass
+            if self.enable_logging:
+                try:
+                    run_logger = _ensure_run_logger(self.enable_logging)
+                    run_logger.error(json.dumps({
+                        "phase": "propose_compile_error",
+                        "task": "induction.propose",
+                        "error": err,
+                        "program_preview": (program_context[:200] if isinstance(program_context, str) else None),
+                    }))
+                except Exception:
+                    pass
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": f"Compile error: {err}"}, payload
         # Normalize each input: accept Python/JSON literals and multi-arg without parens
         normalized_inputs: List[Any] = []
@@ -1325,17 +1348,17 @@ class AZREnv(Environment):
                     except Exception:
                         pass
                 if not parsed_ok:
-                    # Log input parsing error
-                    try:
-                        run_logger = _ensure_run_logger()
-                        run_logger.error(json.dumps({
-                            "phase": "propose_input_parse_error",
-                            "task": "induction.propose",
-                            "error": f"Invalid input literal",
-                            "literal_preview": s[:120],
-                        }))
-                    except Exception:
-                        pass
+                    if self.enable_logging:
+                        try:
+                            run_logger = _ensure_run_logger(self.enable_logging)
+                            run_logger.error(json.dumps({
+                                "phase": "propose_input_parse_error",
+                                "task": "induction.propose",
+                                "error": "Invalid input literal",
+                                "literal_preview": s[:120],
+                            }))
+                        except Exception:
+                            pass
                     return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": f"Invalid input literal: {s[:120]}"}, payload
                 normalized_inputs.append(parsed)
             else:
@@ -1382,18 +1405,18 @@ class AZREnv(Environment):
         if not io_pairs:
             first_err = failed[0][1] if failed else "no valid inputs"
             bad_preview = repr(failed[0][0])[:80] if failed else ""
-            # Log execution error for induction inputs
-            try:
-                run_logger = _ensure_run_logger()
-                run_logger.error(json.dumps({
-                    "phase": "propose_exec_error",
-                    "task": "induction.propose",
-                    "error": first_err,
-                    "input_preview": bad_preview,
-                    "program_preview": (program_context[:200] if isinstance(program_context, str) else None),
-                }))
-            except Exception:
-                pass
+            if self.enable_logging:
+                try:
+                    run_logger = _ensure_run_logger(self.enable_logging)
+                    run_logger.error(json.dumps({
+                        "phase": "propose_exec_error",
+                        "task": "induction.propose",
+                        "error": first_err,
+                        "input_preview": bad_preview,
+                        "program_preview": (program_context[:200] if isinstance(program_context, str) else None),
+                    }))
+                except Exception:
+                    pass
             return False, {"mc_samples": mc_samples, "mc_accuracy": None, "error": f"All proposed inputs failed. Example: input {bad_preview} -> {first_err}"}, payload
         # Split visible/hidden halves
         random.shuffle(io_pairs)
@@ -1526,6 +1549,7 @@ def load_environment(
     # Verbose printing control
     verbose: bool = False,
     exec_timeout: float = 10.0,
+    enable_logging: bool = False,
 ) -> vf.Environment:
     """
     Factory returning an AZREnv instance.
@@ -1549,5 +1573,6 @@ def load_environment(
         init_zero_triplet=init_zero_triplet,
         verbose=verbose,
         exec_timeout=exec_timeout,
+        enable_logging=enable_logging,
     )
     return env
