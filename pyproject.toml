@@ -1,6 +1,6 @@
 [project]
 name = "absolute-zero"
-description = "Your environment description here"
+description = "Absolute Zero Reasoner paper implementation"
 tags = ["placeholder-tag", "train", "eval"]
 version = "0.3.0"
 requires-python = ">=3.11"
